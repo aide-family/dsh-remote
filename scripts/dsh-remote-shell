@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# dsh-remote-shell — interactive host picker for a live remote SSH terminal.
+#
+# Purpose: point the DSH Web/Desktop right-sidebar terminal at a remote host so
+# you can watch and type in a real remote shell. The sidebar terminal runs a
+# configured shell profile; configure it once in the desktop profile patch:
+#
+#   - id: terminal-controller
+#     config:
+#       shell:
+#         path: /Users/hubiao/aide-family/dsh-remote/scripts/dsh-remote-shell
+#         name: Remote SSH
+#         args: []
+#
+# Then "New terminal" in the right sidebar offers "Remote SSH": pick a host (or
+# pass one as the first argument) and you get a normal `ssh -t` session.
+#
+# Usage:
+#   dsh-remote-shell                 # interactive picker over ~/.ssh/config hosts
+#   dsh-remote-shell <host|alias>    # connect directly
+#   dsh-remote-shell --list          # print host names, one per line
+#   DSH_REMOTE_TERMINAL_HOST=me dsh-remote-shell --list
+#
+# Host discovery mirrors the plugin: concrete Host aliases from the OpenSSH
+# config (wildcard aliases are skipped), sorted, deduplicated.
+set -uo pipefail
+
+SSH_CONFIG="${DSH_REMOTE_SSH_CONFIG:-$HOME/.ssh/config}"
+
+list_hosts() {
+  if [ -r "$SSH_CONFIG" ]; then
+    awk '
+      tolower($1) == "host" {
+        for (i = 2; i <= NF; i++) {
+          name = $i
+          if (name ~ /[*?!]/) continue
+          if (!(name in seen)) { seen[name] = 1; print name }
+        }
+      }
+    ' "$SSH_CONFIG" | LC_ALL=C sort -u
+  fi
+}
+
+if [ "${1:-}" = "--list" ]; then
+  list_hosts
+  exit 0
+fi
+
+target="${1:-${DSH_REMOTE_TERMINAL_HOST:-}}"
+
+if [ -n "$target" ]; then
+  exec ssh -t "$target"
+fi
+
+hosts=()
+while IFS= read -r host; do
+  [ -n "$host" ] && hosts+=("$host")
+done < <(list_hosts)
+
+if [ "${#hosts[@]}" -eq 0 ]; then
+  printf 'No concrete hosts found in %s.\n' "$SSH_CONFIG" >&2
+  printf 'Enter a host or user@host manually: ' >&2
+  IFS= read -r target
+  [ -n "$target" ] || exit 1
+  exec ssh -t "$target"
+fi
+
+printf 'Remote SSH terminal — choose a host:\n\n'
+for i in "${!hosts[@]}"; do
+  printf '  %2d) %s\n' "$((i + 1))" "${hosts[$i]}"
+done
+printf '\n  Enter a number, or type a host/user@host (empty aborts): '
+
+IFS= read -r choice || exit 130
+
+case "$choice" in
+  '')
+    exit 130
+    ;;
+  *[!0-9]*)
+    exec ssh -t "$choice"
+    ;;
+  *)
+    if [ "$choice" -ge 1 ] && [ "$choice" -le "${#hosts[@]}" ]; then
+      exec ssh -t "${hosts[$((choice - 1))]}"
+    fi
+    printf 'Invalid selection: %s\n' "$choice" >&2
+    exit 2
+    ;;
+esac

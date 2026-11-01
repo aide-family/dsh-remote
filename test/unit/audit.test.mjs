@@ -1,0 +1,117 @@
+/**
+ * Audit log unit tests: ring bounds, ordering, detail bounding, clear, and
+ * JSONL persistence (durable append + reload of the retained tail).
+ */
+import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+import { boundDetail, createAuditLog } from "../../lib/audit.js";
+
+test("records newest first and bounds the ring", () => {
+  const audit = createAuditLog({ limit: 3 });
+  for (let i = 1; i <= 5; i += 1) {
+    audit.record({ tool: "remote_exec", host: "h", action: "exec", risk: "low", outcome: "ok", detail: `cmd-${i}`, durationMs: i });
+  }
+  const entries = audit.list({ limit: 10 });
+  assert.equal(entries.length, 3);
+  assert.deepEqual(
+    entries.map((entry) => entry.detail),
+    ["cmd-5", "cmd-4", "cmd-3"],
+  );
+  assert.equal(audit.size, 3);
+  assert.equal(entries[0].id, 5);
+});
+
+test("normalizes outcomes and bounds the detail", () => {
+  const audit = createAuditLog();
+  const entry = audit.record({
+    tool: "remote_exec",
+    host: "box",
+    action: "exec",
+    risk: "high",
+    outcome: "denied",
+    detail: `line one\n${"x".repeat(500)}`,
+    durationMs: 12.7,
+  });
+  assert.equal(entry.outcome, "denied");
+  assert.equal(entry.durationMs, 13);
+  assert.ok(entry.detail.length <= 300);
+  assert.ok(entry.detail.endsWith("…"));
+
+  const error = audit.record({ tool: "t", outcome: "error" });
+  assert.equal(error.outcome, "error");
+  const ok = audit.record({ tool: "t", outcome: "something-else" });
+  assert.equal(ok.outcome, "ok");
+  assert.equal(ok.host, "—");
+  assert.equal(boundDetail("  a   b  "), "a b");
+});
+
+test("clear empties memory", () => {
+  const audit = createAuditLog();
+  audit.record({ tool: "remote_exec" });
+  assert.equal(audit.size, 1);
+  assert.deepEqual(audit.clear(), { cleared: true });
+  assert.equal(audit.size, 0);
+  assert.equal(audit.list().length, 0);
+});
+
+test("appends JSONL durably and reloads the retained tail", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dsh-remote-audit-"));
+  const filePath = join(dir, "remote", "audit.jsonl");
+  try {
+    const first = createAuditLog({ limit: 10, filePath });
+    first.record({ tool: "remote_exec", host: "me", action: "exec", risk: "low", outcome: "ok", detail: "uptime", durationMs: 3 });
+    first.record({ tool: "remote_shell_send", host: "me", action: "shell send", risk: "low", outcome: "ok", detail: "echo hi", durationMs: 4 });
+    await first.flush();
+
+    const raw = await readFile(filePath, "utf8");
+    const lines = raw.split("\n").filter((line) => line.trim().length > 0);
+    assert.equal(lines.length, 2);
+    assert.equal(JSON.parse(lines[0]).tool, "remote_exec");
+
+    const second = createAuditLog({ limit: 10, filePath });
+    await second.load();
+    const restored = second.list({ limit: 10 });
+    assert.equal(restored.length, 2);
+    assert.equal(restored[0].tool, "remote_shell_send");
+    assert.equal(restored[1].tool, "remote_exec");
+    // New ids continue after the restored maximum.
+    const third = second.record({ tool: "remote_hosts", outcome: "ok" });
+    assert.equal(third.id, 3);
+
+    // A smaller limit compacts the file to the retained tail on load.
+    const thirdLog = createAuditLog({ limit: 1, filePath });
+    await thirdLog.load();
+    await thirdLog.flush();
+    const compacted = (await readFile(filePath, "utf8")).split("\n").filter((line) => line.trim().length > 0);
+    assert.equal(compacted.length, 1);
+    assert.equal(JSON.parse(compacted[0]).tool, "remote_hosts");
+
+    // Audit clear truncates the file.
+    thirdLog.clear();
+    assert.equal(await readFile(filePath, "utf8"), "");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("tolerates a torn or invalid line on load", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dsh-remote-audit-torn-"));
+  const filePath = join(dir, "audit.jsonl");
+  try {
+    await writeFile(
+      filePath,
+      `${JSON.stringify({ id: 1, time: Date.now(), tool: "remote_exec", host: "me", action: "exec", risk: "low", outcome: "ok", detail: "", durationMs: 1 })}\n{not json\n`,
+      "utf8",
+    );
+    const audit = createAuditLog({ limit: 5, filePath });
+    await audit.load();
+    assert.equal(audit.size, 1);
+    assert.equal(audit.list()[0].tool, "remote_exec");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
