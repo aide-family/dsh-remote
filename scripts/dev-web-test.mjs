@@ -31,7 +31,7 @@ import { startSshServer } from "../test/fixtures/ssh-server.mjs";
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const DSH_HOME = join(REPO, ".dsh-test");
-const PROFILE = "webtest";
+const PROFILE = process.env.DEV_WEB_PROFILE || "webtest";
 
 /** Three injector calls: two hosts, streamed lines, scrollable terminal. */
 const LIVE_EMITS = [
@@ -530,8 +530,17 @@ async function verifyRemoteTerminal(page) {
   const bodyText = () => page.locator("body").innerText();
   await dismissOverlays(page);
 
-  // 1. Open the Remote Ops management page from the sidebar.
-  const entry = page.getByText("远程运维", { exact: false }).first();
+  // 1. Open the Remote Ops management page from the sidebar. Some compositions
+  //    (e.g. dsh-better-sidebar) tuck un-pinned plugin panels into a 更多 menu.
+  let entry = page.getByText("远程运维", { exact: false }).first();
+  if ((await entry.count()) === 0 || !(await entry.isVisible().catch(() => false))) {
+    const more = page.getByText("更多", { exact: true }).first();
+    if ((await more.count()) > 0 && (await more.isVisible().catch(() => false))) {
+      await more.click({ force: true });
+      await page.waitForTimeout(600);
+      entry = page.getByText("远程运维", { exact: false }).first();
+    }
+  }
   try {
     await entry.waitFor({ state: "visible", timeout: 15_000 });
     await entry.click({ force: true });
@@ -549,8 +558,29 @@ async function verifyRemoteTerminal(page) {
   }
   if (failures.length > 0) return failures;
 
-  // 3. Quick connect: opens the DSH native terminal attached to the relay.
+  // 3. Quick connect: v0.5.2 creates a NEW conversation first, then opens the
+  //    DSH native terminal attached to the relay in that conversation.
+  const sessionBefore = await page.evaluate(function readSessionBefore() {
+    const owner = document.querySelector("[data-sidebar-right-session]");
+    return owner === null ? null : owner.getAttribute("data-sidebar-right-session");
+  });
   await connect.click({ force: true });
+  await page.waitForTimeout(2500);
+  const sessionAfter = await page.evaluate(function readSessionAfter() {
+    const owner = document.querySelector("[data-sidebar-right-session]");
+    return owner === null ? null : owner.getAttribute("data-sidebar-right-session");
+  });
+  // A reused blank conversation may legitimately keep the id; what matters is
+  // that the main column switched from the Remote Ops panel to a conversation.
+  console.log(`remote-terminal: conversation ${sessionBefore} -> ${sessionAfter}`);
+  const opsPageGone = (await page.locator('[data-host-action="connect"]').count()) === 0;
+  if (!opsPageGone) {
+    failures.push("quick connect did not switch the main column away from the Remote Ops page");
+  }
+  const composer = page.locator("textarea").first();
+  if ((await composer.count()) === 0) {
+    failures.push("quick connect did not reveal a conversation (no composer after connect)");
+  }
   await page.waitForTimeout(3000);
   const connectDiag = await page.evaluate(function readConnectDiagnostics() {
     const notice = document.querySelector("[data-dsh-remote-notice]");

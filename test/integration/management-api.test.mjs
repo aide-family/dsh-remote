@@ -7,6 +7,7 @@
  * registry and terminal relay, plus the real audit ring.
  */
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -378,7 +379,8 @@ test("overview returns hosts, sessions, policy and the audit trail", async () =>
     assert.equal(status, 200);
     assert.equal(payload.ok, true);
     const result = payload.result;
-    assert.equal(result.version, "0.5.1");
+    const pkg = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
+    assert.equal(result.version, pkg.version);
     assert.equal(result.policy, "auto");
     assert.equal(result.hosts.length, 1);
     assert.equal(result.hosts[0].name, "testbox");

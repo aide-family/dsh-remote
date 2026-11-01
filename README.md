@@ -39,8 +39,12 @@ execution.
   session, and an SSH drop reconnects automatically with backoff. See
   [Interactive remote terminal](#interactive-remote-terminal-type-and-watch).
 - **Quick connect from the host list** — one 连接 action creates the SSH
-  session, opens the native terminal, and hands the host to the agent in the
-  current conversation ("已连接远程主机 …") so it can continue operating.
+  session, opens a **new conversation**, attaches DSH's native terminal to it,
+  and hands the host to the agent there ("已连接远程主机 …") so operations start
+  in a dedicated conversation. Failures after the switch are shown in the
+  远程终端 panel (never a silent local shell), and 复制连接命令 copies the exact
+  shell line for any terminal when the native-terminal integration is
+  unavailable.
 - **Host manager** — add, edit and delete connection entries from the Remote Ops
   page (persisted in `$DSH_HOME/remote/hosts.json`; auth stays
   environment-variable names, never stored secrets).
@@ -90,7 +94,7 @@ Or do the steps manually and choose another profile:
 
 ```sh
 npm run pack:plugin
-dsh plugin --profile desktop add file:$PWD/dist/dsh-remote-0.5.1.tgz --ignore-scripts
+dsh plugin --profile desktop add file:$PWD/dist/dsh-remote-0.5.2.tgz --ignore-scripts
 ```
 
 Then fully quit and reopen the DSH Desktop app (a newly installed bundle is
@@ -277,13 +281,20 @@ DSH's native terminal (real xterm) connected by SSH, and **you** type in it.
 
 How it works:
 
-1. The **远程终端** panel lists the discovered hosts. Pick one and click
-   **打开终端** (or **连接并对话** to also hand the host to the agent).
-2. The plugin opens a native terminal tab in the right sidebar. A small local
-   bridge (`bin/dsh-remote-terminal` → `lib/terminal/bridge.cjs`) connects to the
-   Host's terminal relay over a user-only local socket; the relay owns the SSH
-   PTY (`transport.openPty`). Everything you type reaches the remote shell, and
-   its output (ANSI included) renders in xterm.
+1. The **远程终端** panel (or a host row's **连接** on the Remote Ops page)
+   lists the discovered hosts. Pick one and click **打开终端**/**连接并对话**.
+   **连接** creates/reuses the SSH session and opens a **new conversation**,
+   then attaches the native terminal there; **打开终端** in the panel uses the
+   current conversation.
+2. The plugin opens a native terminal tab in the right sidebar of that
+   conversation. A small local bridge (`bin/dsh-remote-terminal` →
+   `lib/terminal/bridge.cjs`) connects to the Host's terminal relay over a
+   user-only local socket; the relay owns the SSH PTY (`transport.openPty`).
+   Everything you type reaches the remote shell, and its output (ANSI included)
+   renders in xterm. If the tab or the bridge cannot be established, the panel
+   says so, shows the exact command with **复制命令**, and points at
+   `$DSH_HOME/remote/terminal-bridge.log` — paste the command into any local
+   terminal to connect manually.
 3. **One SSH session per conversation + host.** Re-opening the terminal for the
    same host reattaches the same relay session instead of dialing again; closing
    the terminal tab leaves the session alive for `userTerminalTtlMs` so a re-open

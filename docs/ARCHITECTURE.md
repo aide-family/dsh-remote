@@ -1292,3 +1292,62 @@ User feedback after running v0.5 in the Desktop app:
   --host …`, verified locally with the packaged app binary
   (`ELECTRON_RUN_AS_NODE=1 … --version` → v24.21.0), so the bridge no longer
   depends on the terminal's `PATH`.
+
+## v0.5.2 — 连接 opens a new conversation; visible failures; manual fallback
+
+Real-Desktop retest of v0.5.1: `terminal.open` succeeded but the native terminal
+tab never appeared (`打开原生终端超时：5 秒内没有出现新的终端标签页`); the user
+saw only a plain local zsh and no diagnostic, on a session whose persisted right
+sidebar layout was an empty pane. The terminal tab is created through
+`sidebarRight.openTabIn`, which silently no-ops unless that session's right
+sidebar layout store is adopted — so the flow must run against a freshly
+navigated conversation, and every failure after navigation must stay visible.
+
+### Flow contract (`lib/client.js`)
+
+- **连接 / 连接并对话** (management page host row and the panel's talk button)
+  now: (1) create/open a blank conversation with optional
+  `uiWorkspace.startSession()`; (2) wait (≤8 s) for `uiSession.current` to yield
+  a session id and `sidebarRight.mounted` to equal it — a reused blank may keep
+  the previous id, and that is accepted; (3) `terminal.open {name, sessionId:
+  <new id>}` so the relay key `${sessionId}::${host}` matches the conversation
+  the terminal will live in (reopening from that conversation therefore reuses
+  the same SSH PTY); (4) open the native terminal in that session and write the
+  bridge command; (5) after attach verification, send the handoff message into
+  that session. A missing `uiWorkspace`/timeout traces `session` + `fallback`
+  and uses the current-session flow instead.
+- Panel 打开终端 / 接入 keep the current-session behavior (no new conversation).
+- **Failures after navigation are never silent.** A module-level pending notice
+  (message + command + bridge-log hint) is set and `sidebarRight.openTab(
+  "dsh-remote-live")` reveals the 远程终端 panel, which renders the notice with
+  the command `<pre>` and 复制命令. This is what the empty-local-terminal
+  complaint needed.
+- **Manual fallback**: the panel gains a permanent 复制连接命令 button
+  (`data-terminal-action="copy-command"`) that calls `terminal.open` for the
+  selected host and copies `shell.command`, so any terminal can be used to
+  establish the relay connection by hand.
+- **Trace**: new stages `session` (uiWorkspace availability, startSession,
+  previous/new id, waited ms, fallback) and `reveal` (mounted before/after),
+  plus a `tab-probe` detail on tab-wait failure (openTabs count before, mounted
+  id, `tabsIn(sessionId).length`, active kind/id, `openTabIn` availability);
+  `openTabIn` is retried once after ~800 ms before giving up.
+- Browser E2E asserts the on-screen conversation changes after 连接 (new
+  conversation) in addition to the v0.5.1 assertions. Version 0.5.2.
+
+#### v0.5.2 verification (as verified)
+
+- `npm test` → **669 tests, 669 pass** (the management-API overview test now
+  reads the version from package.json instead of a hardcoded value).
+- `node scripts/dev-web-test.mjs --remote-terminal` in the isolated **webtest**
+  profile → PASS: new-conversation switch (main column leaves the Remote Ops
+  page and shows a conversation), native terminal mount, bridge attach
+  (`attachCount=1`, `bytesIn=23`), typed command output, handoff message in the
+  conversation, per-host audit `attach` event + full-detail expansion + JSON
+  export download with `detailFull`, overview audit ≤ 20, and session reuse.
+- The same browser run in an isolated **Desk-like** composition
+  (`dsh-better-sidebar` installed, `DEV_WEB_PROFILE=deskbug`) → PASS, which
+  rules out that common Desktop plugin as the cause of the v0.5.1 empty terminal.
+- The client's scratch harness (104 checks) proves the corrected order
+  (`startSession` before `terminal.open` with the new id), the fallbacks, the
+  pending-panel-notice path (visible command + copy after navigation), and the
+  permanent 复制连接命令 button.
