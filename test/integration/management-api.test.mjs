@@ -146,7 +146,7 @@ test("overview returns hosts, sessions, policy and the audit trail", async () =>
     assert.equal(status, 200);
     assert.equal(payload.ok, true);
     const result = payload.result;
-    assert.equal(result.version, "0.3.0");
+    assert.equal(result.version, "0.4.0");
     assert.equal(result.policy, "auto");
     assert.equal(result.hosts.length, 1);
     assert.equal(result.hosts[0].name, "testbox");

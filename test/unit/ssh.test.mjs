@@ -1085,3 +1085,169 @@ test('pty: concurrent shell and exec on one host both succeed', async (t) => {
     await pty.close()
   }
 })
+
+/* ================================================================== */
+/* live exec output streaming (v0.4 onData)                           */
+/* ================================================================== */
+
+test('exec onData: streams stdout chunks in arrival order while the command runs', async (t) => {
+  const { transport, host, close } = await setup()
+  t.after(close)
+
+  /** @type {Array<{stream: string, chunk: string, at: number}>} */
+  const events = []
+  const result = await transport.exec(host, {
+    command: "printf 'a'; sleep 0.2; printf 'b'",
+    onData: (data) => events.push({ stream: data.stream, chunk: data.chunk, at: Date.now() }),
+  })
+  const finishedAt = Date.now()
+
+  assert.equal(result.stdout, 'ab')
+  assert.equal(events.length >= 2, true, 'each write must produce its own data event')
+  assert.equal(events.every((event) => event.stream === 'stdout'), true)
+  assert.equal(events.map((event) => event.chunk).join(''), 'ab')
+
+  const first = events.find((event) => event.chunk.includes('a'))
+  const second = events.find((event) => event.chunk.includes('b'))
+  assert.ok(first !== undefined && second !== undefined)
+  assert.ok(first.at <= second.at, 'chunk arrival order must be preserved')
+  // Streaming, not batch-after-exit: the first chunk arrived well before the end.
+  assert.ok(first.at < finishedAt - 100, `first chunk should stream early (${finishedAt - first.at}ms before settle)`)
+})
+
+test('exec onData: multi-byte UTF-8 split across chunks is decoded safely exactly once', async (t) => {
+  const { transport, host, close } = await setup()
+  t.after(close)
+
+  /** @type {string[]} */
+  const chunks = []
+  const result = await transport.exec(host, {
+    // 你 (U+4F60) in UTF-8 is e4 bd a0, split by the 150ms pause.
+    command: "printf '\\344'; sleep 0.15; printf '\\275\\240'",
+    onData: (data) => chunks.push(data.chunk),
+  })
+  const streamed = chunks.join('')
+
+  assert.equal(result.stdout, '你')
+  assert.equal(streamed, '你', `streamed text must equal the decoded result, got ${JSON.stringify(chunks)}`)
+  assert.equal(streamed.includes('\uFFFD'), false, 'a split code point must never become U+FFFD')
+  assert.equal(streamed.split('你').length - 1, 1, 'the character must be delivered exactly once')
+})
+
+test('exec onData: stderr events carry stream "stderr" and stdout stays separate', async (t) => {
+  const { transport, host, close } = await setup()
+  t.after(close)
+
+  /** @type {Array<{stream: string, chunk: string}>} */
+  const events = []
+  const result = await transport.exec(host, {
+    command: "printf 'std-out'; printf 'err-out' 1>&2; sleep 0.05; printf 'err-more' 1>&2",
+    onData: (data) => events.push({ stream: data.stream, chunk: data.chunk }),
+  })
+
+  assert.equal(result.stdout, 'std-out')
+  assert.equal(result.stderr, 'err-outerr-more')
+  assert.equal(events.length > 0, true)
+  assert.equal(
+    events.every((event) => event.stream === 'stdout' || event.stream === 'stderr'),
+    true,
+    'every event carries a valid stream tag',
+  )
+  const stdoutText = events.filter((event) => event.stream === 'stdout').map((event) => event.chunk).join('')
+  const stderrText = events.filter((event) => event.stream === 'stderr').map((event) => event.chunk).join('')
+  assert.equal(stdoutText, 'std-out')
+  assert.equal(stderrText, 'err-outerr-more')
+})
+
+test('exec onData: never called after the returned promise settles', async (t) => {
+  const { transport, host, close } = await setup()
+  t.after(close)
+
+  let calls = 0
+  await transport.exec(host, {
+    command: 'printf done',
+    onData: () => {
+      calls += 1
+    },
+  })
+  const callsAtReturn = calls
+  await delay(150)
+  assert.equal(calls, callsAtReturn, 'no callbacks may fire after await returns')
+
+  // Same guarantee on the timeout path (partial output, then settle).
+  let timeoutCalls = 0
+  const timedOut = await transport.exec(host, {
+    command: 'printf start; sleep 5',
+    timeoutMs: 200,
+    onData: () => {
+      timeoutCalls += 1
+    },
+  })
+  assert.equal(timedOut.timedOut, true)
+  const timeoutCallsAtReturn = timeoutCalls
+  assert.ok(timeoutCallsAtReturn >= 1)
+  await delay(150)
+  assert.equal(timeoutCalls, timeoutCallsAtReturn)
+})
+
+test('exec onData: streams the full output even when the result tail is truncated', async (t) => {
+  const { transport, host, close } = await setup()
+  t.after(close)
+
+  /** @type {string[]} */
+  const chunks = []
+  const command = "awk 'BEGIN{for(i=0;i<5000;i++) printf \"line-%05d\\n\", i}'"
+  const result = await transport.exec(host, { command, maxBytes: 1_000, onData: (data) => chunks.push(data.chunk) })
+
+  assert.equal(result.truncated, true)
+  assert.equal(result.stdout.length, 1_000, 'the result keeps only the tail')
+  assert.equal(result.stdoutBytes, 55_000)
+  const streamed = chunks.join('')
+  assert.equal(streamed.length, 55_000, 'the live stream is not bounded by maxBytes')
+  assert.match(streamed, /^line-00000\n/)
+  assert.match(streamed, /line-04999\n$/)
+})
+
+test('exec onData: a throwing observer never changes the exec result', async (t) => {
+  const { transport, host, close } = await setup()
+  t.after(close)
+
+  const result = await transport.exec(host, {
+    command: "printf 'safe'; printf 'err' 1>&2; exit 7",
+    onData: () => {
+      throw new Error('observer exploded')
+    },
+  })
+  assert.equal(result.code, 7)
+  assert.equal(result.stdout, 'safe')
+  assert.equal(result.stderr, 'err')
+})
+
+test('transport.exec onData: chunks flow through the pooled connection path', async (t) => {
+  const { srv, transport, host, close } = await setup()
+  t.after(close)
+
+  /** @type {string[]} */
+  const firstChunks = []
+  const first = await transport.exec(host, {
+    command: "printf 'one-'; sleep 0.1; printf 'two'",
+    onData: (data) => firstChunks.push(data.chunk),
+  })
+  assert.equal(first.stdout, 'one-two')
+  assert.equal(firstChunks.join(''), 'one-two')
+
+  /** @type {string[]} */
+  const secondChunks = []
+  const second = await transport.exec(host, {
+    command: 'printf pooled-stream',
+    onData: (data) => secondChunks.push(data.chunk),
+  })
+  assert.equal(second.stdout, 'pooled-stream')
+  assert.equal(secondChunks.join(''), 'pooled-stream')
+  assert.equal(srv.connectionTotal, 1, 'onData execs must reuse the pooled connection')
+
+  // Without onData the result is unchanged (regression guard).
+  const plain = await transport.exec(host, { command: 'printf plain' })
+  assert.equal(plain.stdout, 'plain')
+  assert.equal(plain.truncated, false)
+})

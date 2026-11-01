@@ -24,6 +24,7 @@ const EXEC = { agent: { id: "agent-1" }, callId: "call-1", signal: new AbortCont
 function config(overrides = {}) {
   return {
     policy: "auto",
+    unprovenCommands: "allow",
     denyCommandPatterns: [],
     readonlyHosts: [],
     allowHosts: [],
@@ -31,7 +32,7 @@ function config(overrides = {}) {
   };
 }
 
-function gate({ policy = "auto", denyCommandPatterns = [], approval } = {}) {
+function gate({ policy = "auto", unprovenCommands = "allow", denyCommandPatterns = [], approval } = {}) {
   const calls = [];
   const ctx = {
     get(name) {
@@ -46,7 +47,10 @@ function gate({ policy = "auto", denyCommandPatterns = [], approval } = {}) {
       };
     },
   };
-  return { gate: createApprovalGate({ ctx, config: config({ policy, denyCommandPatterns }) }), calls };
+  return {
+    gate: createApprovalGate({ ctx, config: config({ policy, unprovenCommands, denyCommandPatterns }) }),
+    calls,
+  };
 }
 
 test("assessCommand: read-only commands are low risk", () => {
@@ -246,4 +250,87 @@ test("truncateSubject bounds long commands", () => {
   assert.ok(result.length <= 300);
   assert.ok(result.endsWith("…"));
   assert.equal(truncateSubject("  ls   -la  "), "ls -la");
+});
+
+test("authorize: unproven (gray) actions run without asking under auto by default", async () => {
+  const { gate: g, calls } = gate();
+  const decision = await g.authorize({
+    toolName: "remote_exec",
+    exec: EXEC,
+    host: HOST,
+    action: "execute",
+    subject: "curl -s https://example.com",
+    mutating: false,
+    unproven: true,
+    verb: "curl",
+  });
+  assert.deepEqual(decision, { allowed: true });
+  assert.equal(calls.length, 0);
+});
+
+test("authorize: unproven actions ask when unprovenCommands is ask", async () => {
+  const { gate: g, calls } = gate({ unprovenCommands: "ask" });
+  const decision = await g.authorize({
+    toolName: "remote_exec",
+    exec: EXEC,
+    host: HOST,
+    action: "execute",
+    subject: "curl -s https://example.com",
+    mutating: false,
+    unproven: true,
+    verb: "curl",
+  });
+  assert.equal(decision.allowed, true);
+  assert.equal(decision.outcome, "allowed-once");
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].reason, /curl -s/);
+});
+
+test("authorize: policy never denies unproven actions", async () => {
+  const { gate: g, calls } = gate({ policy: "never" });
+  const decision = await g.authorize({
+    toolName: "remote_exec",
+    exec: EXEC,
+    host: HOST,
+    action: "execute",
+    subject: "awk '{print $1}' f",
+    mutating: false,
+    unproven: true,
+  });
+  assert.equal(decision.allowed, false);
+  assert.match(decision.reason, /policy is "never"/);
+  assert.equal(calls.length, 0);
+});
+
+test("authorize: a read-only host denies unproven actions", async () => {
+  const { gate: g, calls } = gate();
+  const decision = await g.authorize({
+    toolName: "remote_exec",
+    exec: EXEC,
+    host: HOST,
+    action: "execute",
+    subject: "python -c 'print(1)'",
+    mutating: false,
+    unproven: true,
+    readonlyHost: true,
+  });
+  assert.equal(decision.allowed, false);
+  assert.match(decision.reason, /read-only/);
+  assert.equal(calls.length, 0);
+});
+
+test("authorize: a read-only host still allows statically read-only actions", async () => {
+  const { gate: g, calls } = gate();
+  const decision = await g.authorize({
+    toolName: "remote_exec",
+    exec: EXEC,
+    host: HOST,
+    action: "execute",
+    subject: "df -h",
+    mutating: false,
+    unproven: false,
+    readonlyHost: true,
+  });
+  assert.deepEqual(decision, { allowed: true });
+  assert.equal(calls.length, 0);
 });

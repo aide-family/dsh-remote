@@ -178,6 +178,7 @@ function baseConfig(overrides = {}) {
     allowLocalOutsideWorkspace: false,
     promptGuidance: true,
     managementApi: false,
+    liveTerminal: false,
     ...overrides,
   };
 }
@@ -230,14 +231,27 @@ test("terminalEnabled=false keeps the shell surface out", () => {
   assert.equal(sections.length, 1);
 });
 
-test("management API route registers only with a web server and the default config", () => {
-  const { routes } = mount(baseConfig({ managementApi: true }));
-  assert.equal(routes.length, 1);
-  assert.equal(routes[0].kind, "prefix");
-  assert.equal(routes[0].path, "/dsh-remote/api");
-  assert.equal(typeof routes[0].handler, "function");
+test("management API and live stream routes register only with a web server", () => {
+  const both = mount(baseConfig({ managementApi: true, liveTerminal: true }));
+  assert.equal(both.routes.length, 2);
+  const api = both.routes.find((route) => route.path === "/dsh-remote/api");
+  const live = both.routes.find((route) => route.path === "/dsh-remote/live");
+  assert.ok(api !== undefined);
+  assert.equal(api.kind, "prefix");
+  assert.equal(typeof api.handler, "function");
+  assert.ok(live !== undefined);
+  assert.equal(live.kind, "exact");
+  assert.equal(typeof live.handler, "function");
 
-  const off = mount(baseConfig({ managementApi: false }));
+  const apiOnly = mount(baseConfig({ managementApi: true, liveTerminal: false }));
+  assert.equal(apiOnly.routes.length, 1);
+  assert.equal(apiOnly.routes[0].path, "/dsh-remote/api");
+
+  const liveOnly = mount(baseConfig({ managementApi: false, liveTerminal: true }));
+  assert.equal(liveOnly.routes.length, 1);
+  assert.equal(liveOnly.routes[0].path, "/dsh-remote/live");
+
+  const off = mount(baseConfig({ managementApi: false, liveTerminal: false }));
   assert.equal(off.routes.length, 0);
 });
 

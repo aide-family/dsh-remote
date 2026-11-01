@@ -1,6 +1,6 @@
 {
   "name": "dsh-remote",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "SSH remote-server operations for DeepSeek Harness: host discovery from ~/.ssh/config, remote command execution, SFTP file tools, and Crescent-style command risk review with approval gating.",
   "type": "module",
   "main": "lib/index.js",
@@ -19,7 +19,8 @@
     "README.md",
     "LICENSE",
     "docs/icon.svg",
-    "docs/assets/management-page.png"
+    "docs/assets/management-page.png",
+    "docs/assets/remote-terminal.png"
   ],
   "keywords": [
     "dsh",

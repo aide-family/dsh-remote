@@ -151,7 +151,7 @@ async function main() {
   log(`  DSH_HOME: ${DSH_HOME}`);
   log(`  profile: ${PROFILE}`);
 
-  log("\n[1/7] preparing the isolated DSH profile");
+  log("\n[1/8] preparing the isolated DSH profile");
   let setup = await run("bash", [join(REPO_DIR, "scripts", "dev-profile.sh"), PROFILE], {
     env: { ...CHILD_ENV, DSH_DEV_HOME: DSH_HOME },
   });
@@ -168,7 +168,7 @@ async function main() {
   await rm(join(DSH_HOME, "remote", "known-hosts.json"), { force: true });
   pass(skipSync ? "profile prepared (using the profile's installed plugin)" : "profile prepared and plugin synced");
 
-  log("\n[2/7] starting the SSH server fixture");
+  log("\n[2/8] starting the SSH server fixture");
   server = await startSshServer();
   await writeFile(join(server.rootDir, "e2e-note.txt"), "line-one\nline-two\nline-three\n", "utf8");
   await mkdir(join(server.rootDir, "scratch"), { recursive: true });
@@ -199,7 +199,7 @@ async function main() {
   );
 
   try {
-    log("\n[3/7] remote_hosts: the model must discover the fixture host");
+    log("\n[3/8] remote_hosts: the model must discover the fixture host");
     {
       const result = await runDsh("Call the remote_hosts tool and tell me the exact names of the available hosts. Reply with the names only.");
       if (assertRunOk(result, "remote_hosts")) {
@@ -216,7 +216,7 @@ async function main() {
       }
     }
 
-    log("\n[4/7] remote_exec (read-only): runs over the real SSH connection");
+    log("\n[4/8] remote_exec (read-only): runs over the real SSH connection");
     {
       const result = await runDsh(
         "Use the remote_exec tool with host \"testbox\" to run exactly: echo e2e-ok-123. Do not use any other tool. Report the exit code and stdout.",
@@ -236,7 +236,7 @@ async function main() {
       }
     }
 
-    log("\n[5/7] remote_read: reads real remote file content");
+    log("\n[5/8] remote_read: reads real remote file content");
     {
       const result = await runDsh(
         `Use the remote_read tool with host "testbox" and path "${join(server.rootDir, "e2e-note.txt")}" and tell me the last line of the file.`,
@@ -255,7 +255,7 @@ async function main() {
       }
     }
 
-    log("\n[6/7] remote_exec (mutating): must fail closed without an approval answerer");
+    log("\n[6/8] remote_exec (mutating): must fail closed without an approval answerer");
     {
       const result = await runDsh(
         `Use the remote_exec tool with host "testbox" to run exactly: rm -rf '${join(server.rootDir, "scratch")}'. Report exactly whether it ran or was denied.`,
@@ -273,7 +273,26 @@ async function main() {
         }
       }
     }
-    log("\n[7/7] remote_shell_*: persistent PTY session (open -> send -> close)");
+    log("\n[7/8] non-mutating unproven command: runs without approval under the new policy");
+    {
+      const result = await runDsh(
+        `Use the remote_exec tool with host "testbox" to run exactly: awk 'BEGIN{print "gray-auto-ok"}'. Do not use any other tool. Report the output and whether it was allowed.`,
+      );
+      if (assertRunOk(result, "gray auto-allow")) {
+        const call = findToolCall(result, "remote_exec");
+        if (call === undefined) {
+          fail(`gray auto-allow: the model did not call the tool\n${eventDiagnostics(result)}`);
+        } else {
+          const toolResult = findToolResult(result, call.callId);
+          const text = String(toolResult?.result ?? "");
+          if (toolResult?.status === "error") fail(`gray auto-allow: tool error (should have run): ${text}`);
+          else if (!text.includes("gray-auto-ok")) fail(`gray auto-allow: output missing: ${text}`);
+          else pass("unproven (gray) command ran without approval and returned its output");
+        }
+      }
+    }
+
+    log("\n[8/8] remote_shell_*: persistent PTY session (open -> send -> close)");
     {
       const result = await runDsh(
         `Use the remote_shell_open tool with host "testbox", then remote_shell_send with the returned sessionId and text "echo shell-live-456", then remote_shell_close for that session. Do not use any other tool. Report the shell output and whether the session was closed.`,

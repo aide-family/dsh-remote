@@ -403,16 +403,18 @@ or compatible; the full suite and the headless e2e agree with them.
 
 ### Verification performed
 
-- `node --test test/unit/*.test.mjs test/integration/*.test.mjs` → **545 tests,
-  545 pass** (parser, policy, config, hosts, known-hosts, ssh transport incl.
-  interactive PTY, remote tools, shell tools/manager/scrollback, audit log,
-  management HTTP API, and real-fixture plugin integration tests).
+- `node --test test/unit/*.test.mjs test/integration/*.test.mjs` → **582 tests,
+  582 pass** (parser, policy, config, hosts, known-hosts, ssh transport incl.
+  interactive PTY and exec streaming, remote tools, shell tools/manager/
+  scrollback, audit log, live hub, live SSE route, management HTTP API, tool-level
+  live-event wiring, and real-fixture plugin integration tests).
 - `node scripts/e2e.mjs` → **PASSED** against the real DSH headless profile:
   plugin load through the bundle patch, model-driven `remote_hosts`,
   `remote_exec` (read-only, `[exit code: 0]`), `remote_read` content, and a
-  mutating `remote_exec` denied fail-closed without an answerer, and a full
+  mutating `remote_exec` denied fail-closed without an answerer, an unproven
+  (gray) command running without approval under the default policy, and a full
   persistent-shell cycle (`remote_shell_open` → `remote_shell_send` →
-  `remote_shell_close`) echoed real PTY output.
+  `remote_shell_close`) echoing real PTY output.
 - The same e2e passes with `E2E_SKIP_SYNC=1` + `DSH_TEST_PROFILE=tarballtest`
   against a `dsh plugin add file:…tgz --ignore-scripts` install, which proves
   the packaged artifact resolves its DSH peers without the devDependencies.
@@ -676,3 +678,152 @@ window.__ModuleLoader__.load({ id: "dsh-remote", factory(require) { … return {
   showed the six operations produced by a real headless agent run (including a
   fail-closed `denied` high-risk `rm -rf`). No browser console errors and no
   failed HTTP responses were reported.
+
+## Live terminal mirror (v0.4): agent commands streamed into a right-sidebar terminal
+
+Three product requirements drive this version:
+
+1. **Non-mutating commands never ask.** Under `policy: auto`, only commands the
+   static classifier proves mutating (`high`) need approval; `low` **and `gray`**
+   (unproven, e.g. `curl`, `awk`, `python -c`, unknown binaries) run directly.
+   A new config `unprovenCommands: "allow" | "ask"` (default `"allow"`) restores
+   approval for gray commands. Read-only hosts, `policy: never` and
+   `denyCommandPatterns` keep their stricter behaviour (`never` still denies
+   gray, read-only hosts still deny anything not statically read-only).
+2. **The conversation opens a live terminal on the right.** A right-sidebar tab
+   ("远程终端") shows the remote commands the agent runs.
+3. **Agent commands are injected into that terminal in real time**, so the user
+   watches the actual execution (command line, streamed stdout/stderr, exit
+   status), not just the final tool result.
+
+### Host: streaming output
+
+- `transport.exec(host, opts)` gains an optional `onData({ stream, chunk })`
+  callback (`stream: "stdout"|"stderr"`, `chunk`: UTF-8 string decoded with a
+  per-stream `StringDecoder` so multi-byte characters never split). Existing
+  callers are unaffected; the returned result is unchanged.
+- `manager.send({ agent, sessionId, text, submit, signal, onData? })` gains the
+  same optional `onData({ stream: "stdout", chunk })` callback, fed with the
+  sanitized text the PTY session appends to scrollback.
+
+### Host: live hub + SSE
+
+`lib/live.js` — `createLiveHub({ maxCommands, maxOutputPerCommand, maxTotalOutput })`:
+
+```js
+hub.begin({ sessionId, tool, host, command, kind }) -> LiveCommand
+LiveCommand: { id, output(stream, text), note(text), end({ code?, error?, durationMs? }) }
+hub.snapshot() -> { commands: [LiveCommandSnapshot...] }   // bounded, newest last
+hub.subscribe(listener) -> unsubscribe                     // listener(event) for every event
+hub.clear()
+```
+
+Events on the wire (one JSON object per SSE `data:` frame):
+
+- `{ "type": "start", "id", "time", "sessionId", "tool", "host", "command", "kind" }`
+- `{ "type": "output", "id", "stream": "stdout"|"stderr"|"note", "text" }`
+- `{ "type": "end", "id", "time", "code"?, "error"?, "durationMs" }`
+- `{ "type": "clear" }`
+- The first frame after connecting: `{ "type": "snapshot", "commands": [...] }`
+  (each snapshot command: id/sessionId/tool/host/command/kind/time/status/
+  output (bounded) / code / error / durationMs / endedAt).
+
+SSE route: `GET /dsh-remote/live` registered through the same `webServer` as the
+management API, fenced by `ctx.get("connection").requestRejection(req)` (403 when
+rejected, 503 when no fence service). Headers: `content-type: text/event-stream`,
+`cache-control: no-cache`, `connection: keep-alive`. A `: ping` comment every
+15 s; the stream closes when the request closes and unsubscribes from the hub.
+
+Instrumentation (tool layer, `lib/index.js` passes a `live` dep):
+
+- `remote_exec`: start before approval (denied attempts still appear, ended with
+  `error`/`denied`), stream stdout/stderr via `transport.exec({ onData })`, end
+  with the exit code.
+- `remote_shell_send`: start with the input text, stream the send's output via
+  `manager.send({ onData })`, end with `waitReason`/`sessionStatus` (nonzero
+  code when the shell exited).
+- `remote_shell_open` / `signal` / `close`: short informational start/end entries.
+- Everything else stays off the live stream (reads/writes keep their cards).
+
+Config: `liveTerminal: true` (register the SSE route + client tab trigger),
+`autoOpenLiveTerminal: true` (the browser half opens the tab on the first live
+command of the session).
+
+### Client: right-sidebar tab
+
+- Stage one: `ctx.sidebarRightTabs.register({ id: "dsh-remote-live",
+  kind: "dsh-remote-live", title: () => "远程终端", guide: [{ id:
+  "remote-terminal", order: 30, title, description }] })`.
+- Stage two: `ctx.slots.register({ name: "sidebar.right.pane.tab", key:
+  "dsh-remote-live" }, RemoteTerminalPanel)` (inside `ctx.slots.inject`).
+- Opening: `ctx.sidebarRight.openTab("dsh-remote-live")` from the guide entry and
+  automatically on the first live event of the current session when
+  `autoOpenLiveTerminal` is on.
+- The panel connects to `/dsh-remote/live` with `EventSource` (same-origin
+  cookie), replays the snapshot, appends start/output/end frames as terminal
+  lines (`$ command`, output, status line; ANSI stripped on the host), keeps
+  auto-scroll unless the user scrolled up, offers Clear and a host filter, and
+  reconnects automatically. It filters to the tab's session id when one is
+  present (props `sessionId`), otherwise shows every session with a short label.
+
+### Live terminal implementation notes (v0.4, as verified)
+
+- **Policy semantics.** `authorize()` takes `mutating` (classifier `high`) and
+  `unproven` (classifier `gray`) separately. Read-only hosts deny anything not
+  proven read-only, `policy: never` denies both classes, `policy: always` asks
+  for everything, and `policy: auto` asks only for `high` unless
+  `unprovenCommands: "ask"` (then gray asks too). `denyCommandPatterns` still
+  short-circuits before the live hub's `start`? No: the hub starts first so the
+  attempt is visible, then the denial ends it with an error.
+- **Streaming** is additive on both layers: `transport.exec({ onData })` uses a
+  per-stream `StringDecoder` and never calls back after settlement;
+  `manager.send({ onData })` forwards the sanitized text the PTY session appends
+  to scrollback (PTY stderr is merged; stream is always `"stdout"`).
+- **Hub bounds** are `maxCommands` 200, 64 KiB per command (tail kept), 1 MiB
+  total; the oldest output is evicted first, then the oldest commands. A
+  throwing subscriber is isolated. `clear()` emits a `clear` frame.
+- **SSE** is an exact GET route fenced like `/api` (403 rejected, 503 without the
+  connection service, 405 non-GET, 404 wrong path). The first frame is the
+  snapshot; a `: ping` heartbeat runs every 15 s; disconnect unsubscribes.
+- **Tool wiring** lives in the tool layer (`beginLive`/`sessionIdOf` helpers):
+  `remote_exec` streams stdout/stderr and ends with the exit code, shell send
+  streams sanitized output and a `[waitReason]` note, shell open/signal/close
+  publish short informational entries; a missing or throwing hub can never break
+  a tool call. Session identity comes from `exec.agent.session.id`.
+- **Browser verification** (`scripts/dev-web-test.mjs`, liveui work): the tab
+  type registers through `ctx.sidebarRightTabs` + `sidebar.right.pane.tab`,
+  auto-opens on the first live `start` for the session, renders the SSE frames
+  in a monospaced terminal-like log, and the checked-in screenshot
+  `docs/assets/remote-terminal.png` was captured from a real DSH Web profile
+  using the dev-only `live.emit` management method (`devLiveEvents: true` in the
+  dev profile only).
+
+### Client panel registration (v0.4, as verified by the browser loop)
+
+- The browser half awaits the right-Sidebar services in a separate optional
+  `ctx.inject(["sidebarRightTabs", "sidebarRight"], …)`, so a composition without
+  that column still keeps the 远程运维 page; all registrations live in
+  `ctx.effect`.
+- Stage one: `sidebarRightTabs.register({ id: "dsh-remote-live", kind:
+  "dsh-remote-live", title: () => "远程终端", guide: [{ id: "remote-terminal",
+  order: 30, … }] })`; stage two: keyed `sidebar.right.pane.tab` and
+  `sidebar.right.pane.tab.title` registrations under the same id.
+- One shared `EventSource("/dsh-remote/live")` per page feeds every mounted
+  panel and the auto-opener; the panel renders snapshot + start/output/end/clear
+  with bounded client scrollback (200 commands / 120 KiB per command / 600 KiB
+  total), host filter, connection state, local Clear (there is no host
+  `live.clear` method; a local-cleared timestamp prevents a reconnect snapshot
+  from resurrecting cleared commands), auto-follow with a jump-to-bottom chip,
+  and automatic reconnect.
+- Auto-open: the watcher takes the on-screen session from
+  `sidebarRight.mounted`, and on the first `start` for it (null session counts,
+  foreign sessions ignored) calls `openTab("dsh-remote-live")` once per session
+  per page load when the overview flag `live.autoOpen` is true; `openTab` itself
+  expands a collapsed column (verified).
+- `scripts/dev-web-test.mjs --emit-live` drives the whole path in a real DSH Web
+  profile: asserts the guide entry, collapses the column, emits three dev
+  commands (two hosts), checks auto-open/已连接/command+output text/count,
+  session and host filters, internal scrolling and bottom-follow semantics,
+  scrolled-up freeze + jump back, and Clear; it fails non-zero on any
+  console.error/pageerror/HTTP≥400. `docs/assets/remote-terminal.png` is the
+  captured result; browser diagnostics were empty.

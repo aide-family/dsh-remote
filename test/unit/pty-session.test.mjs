@@ -437,3 +437,103 @@ test('close: a failing transport close is surfaced after the session is torn dow
   await assert.rejects(session.close(), /channel already gone/)
   assert.equal(session.isClosed, true)
 })
+
+// ---------------------------------------------------------------------------
+// Live terminal mirror streaming (optional onData callback)
+// ---------------------------------------------------------------------------
+
+test('onData: streams sanitized send output as {stream:"stdout",chunk}', async () => {
+  const { pty, session } = await startedSession()
+  const events = []
+  const operation = session.startSend({
+    text: 'echo hi',
+    submit: true,
+    onData: (event) => events.push(event),
+  })
+  pty.emitData('echo hi\r\n\x1b[32mhi\x1b[0m\r\n$ ')
+  const result = await operation.done
+  assert.equal(result.waitReason, 'inferred_idle')
+  // ANSI escapes stripped, other terminal control characters preserved verbatim.
+  assert.deepEqual(events, [{ stream: 'stdout', chunk: 'echo hi\r\nhi\r\n$ ' }])
+  await session.close()
+})
+
+test('onData: skips startup/escape-only output and never fires after settlement', async () => {
+  const { pty, session, started } = await startedSession()
+  assert.match(started.motd, /welcome/)
+  const events = []
+  const operation = session.startSend({
+    text: 'run',
+    submit: true,
+    onData: (event) => events.push(event),
+  })
+  pty.emitData('\x1b[0m\x1b[2J')
+  assert.deepEqual(events, [])
+  pty.emitData('visible\r\n')
+  assert.deepEqual(events, [{ stream: 'stdout', chunk: 'visible\r\n' }])
+  const result = await operation.done
+  assert.equal(result.waitReason, 'inferred_idle')
+  const settledCount = events.length
+  pty.emitData('after settle\r\n')
+  assert.equal(events.length, settledCount)
+  // Late output still reaches scrollback (only the live stream stops).
+  assert.match(session.read({ offset: 0, count: 5 }).text, /after settle/)
+  await session.close()
+})
+
+test('onData: a throwing callback never breaks the send or the session', async () => {
+  const { pty, session } = await startedSession()
+  let calls = 0
+  const operation = session.startSend({
+    text: 'explode',
+    submit: true,
+    onData: () => {
+      calls += 1
+      throw new Error('mirror boom')
+    },
+  })
+  pty.emitData('first\r\n')
+  pty.emitData('second\r\n$ ')
+  const result = await operation.done
+  assert.equal(calls, 2)
+  assert.equal(result.waitReason, 'inferred_idle')
+  assert.match(result.viewport, /first/)
+  assert.match(result.viewport, /second/)
+
+  // The session remains usable for the next send.
+  const next = session.startSend({ text: 'again', submit: true })
+  assert.equal(pty.writes.at(-1), 'again\r')
+  pty.emitData('ok\r\n$ ')
+  assert.equal((await next.done).waitReason, 'inferred_idle')
+  await session.close()
+})
+
+test('onData: streaming does not change readOutput or the settled viewport', async () => {
+  const { pty, session } = await startedSession()
+  const events = []
+  const operation = session.startSend({
+    text: 'split',
+    submit: true,
+    onData: (event) => events.push(event),
+  })
+  pty.emitData('one\r\n')
+  const delta = operation.readOutput()
+  pty.emitData('two\r\n$ ')
+  const result = await operation.done
+  assert.match(delta.delta, /one/)
+  assert.match(result.viewport, /two/)
+  assert.equal(result.viewport.includes('one'), false)
+  assert.equal(events.length, 2)
+  await session.close()
+})
+
+test('onData: omitting the callback leaves send semantics unchanged', async () => {
+  const { pty, session } = await startedSession()
+  const operation = session.startSend({ text: 'echo plain', submit: true })
+  pty.emitData('echo plain\r\nplain\r\n$ ')
+  const result = await operation.done
+  assert.equal(result.waitReason, 'inferred_idle')
+  assert.equal(result.truncated, false)
+  assert.match(result.viewport, /plain/)
+  await session.close()
+})

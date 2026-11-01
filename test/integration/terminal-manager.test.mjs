@@ -452,3 +452,38 @@ test('remote shell manager: admin surface sees every owner without fencing agent
   )
   await manager.dispose()
 })
+
+// ---------------------------------------------------------------------------
+// Live terminal mirror streaming through the manager
+// ---------------------------------------------------------------------------
+
+test('remote shell manager: manager.send forwards onData streaming', async () => {
+  const config = makeConfig({
+    terminalIdleSilenceMs: 30,
+    terminalTimeoutMs: 120,
+    terminalStartupTimeoutMs: 2_000,
+  })
+  const transport = makeFakeTransport()
+  const manager = createShellManager({ transport, config, logger: QUIET_LOGGER })
+  const agent = { id: 'stream-test-agent' }
+  const host = { id: 'config:fake', name: 'fake', host: '127.0.0.1' }
+  const opened = await manager.open({ agent, host })
+
+  const events = []
+  const sending = manager.send({
+    agent,
+    sessionId: opened.sessionId,
+    text: 'echo stream',
+    onData: (event) => events.push(event),
+  })
+  transport.created[0].emitData('\x1b[31mstreamed\x1b[0m\n$ ')
+  const result = await sending
+  assert.equal(result.waitReason, 'inferred_idle')
+  assert.deepEqual(events, [{ stream: 'stdout', chunk: 'streamed\n$ ' }])
+
+  // No streaming after the send settled.
+  transport.created[0].emitData('after settlement\n')
+  assert.equal(events.length, 1)
+  await manager.close({ agent, sessionId: opened.sessionId })
+  await manager.dispose()
+})

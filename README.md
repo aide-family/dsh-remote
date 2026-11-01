@@ -27,6 +27,15 @@ execution.
   keep using it across tool calls (`remote_shell_*`): send input, read
   scrollback, interrupt with signals, close. Every submitted line is
   risk-reviewed like `remote_exec`.
+- **Live terminal mirror** — a **Remote Terminal** tab in the conversation's
+  right sidebar shows every remote command the agent runs as it runs, with
+  streamed stdout/stderr and status lines. It opens automatically on the first
+  command (or from the sidebar's Start page). See [Live terminal](#live-terminal-right-sidebar).
+- **Non-mutating commands never ask** — under the default policy only commands
+  the static classifier *proves* mutating need approval; read-only and
+  unprovable-but-non-mutating commands (e.g. `curl`, `awk`, `python -c`) run
+  directly, while `policy: never`, read-only hosts, `denyCommandPatterns` and the
+  approval seam keep their stricter behaviour.
 - **Remote Ops management page** — a first-level panel in the DSH Web GUI with
   the discovered host inventory (per-row read-only connection test), live remote
   shell sessions (scrollback preview + close), and a persisted audit trail of
@@ -66,7 +75,7 @@ Or do the steps manually and choose another profile:
 
 ```sh
 npm run pack:plugin
-dsh plugin --profile desktop add file:$PWD/dist/dsh-remote-0.3.0.tgz --ignore-scripts
+dsh plugin --profile desktop add file:$PWD/dist/dsh-remote-0.4.0.tgz --ignore-scripts
 ```
 
 Then fully quit and reopen the DSH Desktop app (a newly installed bundle is
@@ -134,6 +143,9 @@ too (useful for headless and CI):
     maxReadBytes: 800000
     maxTransferBytes: 52428800
     knownHostsPolicy: tofu       # tofu | strict | insecure
+    unprovenCommands: allow      # allow (only provably mutating asks) | ask
+    liveTerminal: true           # right-sidebar live terminal + /dsh-remote/live
+    autoOpenLiveTerminal: true
 ```
 
 Hosts from `~/.ssh/config` need no configuration at all. If `~/.ssh/config`
@@ -169,7 +181,7 @@ results or approval prompts.
 | --- | --- | --- |
 | `remote_hosts` | yes | List usable hosts, auth hints, and policy flags. |
 | `remote_probe` | yes | Connect and report hostname, OS/kernel, uptime, load, memory, disk, and latency. |
-| `remote_exec` | no | Run one non-interactive command with optional `workdir` and timeout. |
+| `remote_exec` | per classifier | Run one non-interactive command with optional `workdir` and timeout; only provably mutating commands ask for approval. |
 | `remote_read` | yes | Read a remote text file with line numbers, `offset`/`limit`, and a continue hint. |
 | `remote_list` | yes | List a remote directory with type/size/mtime/mode. |
 | `remote_write` | no | Write a remote file atomically, creating missing directories. |
@@ -258,6 +270,41 @@ Then use **New terminal** in the right sidebar and pick a host. The picker also
 accepts a host directly (`dsh-remote-shell me`) or `--list`. This pane is an
 ordinary `ssh -t` session and is independent of the agent's sessions.
 
+## Live terminal (right sidebar)
+
+Every `remote_exec` command and submitted `remote_shell_send` line is mirrored
+into a right-sidebar tab, so you watch the real execution instead of only the
+final tool card:
+
+![Remote Terminal panel](docs/assets/remote-terminal.png)
+
+- **Opens automatically** on the first remote command of the session (the
+  right-sidebar column expands), and is also available from the right sidebar's
+  Start page as a **远程终端** entry.
+- **Streams in real time**: a prompt line (`$ command`, host, session), the
+  command's stdout/stderr chunks as they arrive, and a status line
+  (`[exit 0 · 812ms]` / `[error: …]` / `[running]`). Denied commands appear too,
+  so you see exactly what the agent attempted.
+- **Bounded and private**: the stream is served from the running Host over a
+  fenced same-origin SSE route (`/dsh-remote/live`); the Host keeps a bounded
+  replay buffer (last 200 commands, 64 KiB per command, 1 MiB total) so a late
+  panel still shows recent activity. Nothing is written to disk for the stream.
+- **Controls**: connection state, per-host filter, local clear, auto-scroll
+  (unless you scrolled up), automatic reconnect.
+
+```yaml
+- id: dsh-remote
+  config:
+    liveTerminal: true            # serve /dsh-remote/live + register the tab
+    autoOpenLiveTerminal: true    # auto-open on the first command
+```
+
+**Approval policy (default `auto`)**: only provably mutating commands ask. Set
+`unprovenCommands: "ask"` to require approval for commands the classifier cannot
+prove read-only (unknown binaries, `curl`, `awk`, …), or keep the strict
+`policy: never` for unattended runs (mutating and unproven commands are denied,
+read-only commands run).
+
 ## Management page (Remote Ops / 远程运维)
 
 The plugin registers a first-level sidebar panel in the DSH Web/Desktop GUI:
@@ -284,13 +331,15 @@ config if you do not want the route registered.
 ## Safety model
 
 - **Static review before approval.** Every `remote_exec` command is classified
-  by the ported Crescent classifier. `low` (statically read-only) runs without a
-  prompt; `high`/`gray` require approval under `policy: auto` (and `remote_write`
-  / `remote_edit` / `remote_transfer` always do).
+  by the ported Crescent classifier. Under `policy: auto` only `high` (provably
+  mutating) commands need approval; `low` and `gray` (unproven) run directly,
+  with the live terminal and audit trail recording them. `unprovenCommands: ask`
+  restores approval for the unproven class, and `remote_write` / `remote_edit` /
+  `remote_transfer` always need approval.
 - **Fail closed.** No approval answerer mounted, a cancelled prompt, a rejected
   prompt, or an approval-service failure all deny the action.
-- **`policy: never`** is the headless/unattended stance: read-only actions work;
-  every mutating action is denied with an explanation.
+- **`policy: never`** is the headless/unattended stance: statically read-only
+  actions work; mutating and unproven actions are denied with an explanation.
 - **Host-level guards.** `readonlyHosts` denies every mutating action on matching
   hosts in every policy mode; `allowHosts` (non-empty) hides and rejects
   everything else; `denyCommandPatterns` always denies a matching command.
@@ -340,8 +389,11 @@ actions are asserted to fail closed in headless mode.
 - **No full-screen TUI in agent shells.** `remote_shell_*` output is
   line-sanitized, so `vim`/`top`/`less` are not usable from the agent; use
   non-interactive commands. The user sidebar terminal (above) is a real xterm.
-- **Shell sessions are process-local** and end when the harness restarts; long
-  work belongs in files or `nohup`.
+- **Shell sessions and the live stream are process-local.** The terminal mirror
+  retains a bounded in-memory buffer only; a harness restart clears it (the audit
+  trail persists).
+- **The live mirror shows `remote_exec` and shell sends**, not file reads/writes
+  (those keep their tool cards) and not commands run outside the plugin.
 - **One send at a time per remote shell**, bounded by `terminalTimeoutMs`.
 - **The management page needs the Web/Desktop surface.** Headless CLI runs have
   no HTTP server, so the API and page are not mounted there (tools still work).
@@ -358,6 +410,8 @@ lib/
   client.js       browser half: sidebar "Remote Ops" panel + page
   api.js          Host JSON API behind the management page (fenced)
   audit.js        bounded audit trail (memory ring + JSONL persistence)
+  live.js         live command hub for the right-sidebar terminal
+  live-stream.js  fenced SSE transport (/dsh-remote/live)
   tools.js        8 defineTool definitions
   render.js       canonical value -> model text
   approval.js     policy + risk review + DSH approval seam
@@ -381,17 +435,20 @@ Crescent project (`aide-family/Crescent`, `src/shared/command-guard.ts`,
 ## Verification
 
 ```sh
-npm test        # 545 tests: unit + real-fixture integration (no external servers)
+npm test        # 582 tests: unit + real-fixture integration (no external servers)
 npm run e2e     # real DSH headless run against a fixture SSH server
 ```
 
 The e2e suite proves the model actually calls the tools through the DSH pipeline,
 that read-only remote actions work, that mutating actions fail closed in headless
-mode, and that a persistent PTY shell opens, echoes a command, and closes
-cleanly. The management page is verified in a real browser against an isolated
+mode, that a persistent PTY shell opens, echoes a command, and closes cleanly,
+and that an unproven (gray) command now runs without approval. The management page is verified in a real browser against an isolated
 DSH Web profile (`npm run dev:web` boots it, drives it with headless Chrome, and
 writes a screenshot); the checked-in screenshot above was produced that way,
-including a live "test connection" against a real SSH host. A packaged tarball
+including a live "test connection" against a real SSH host. The live terminal is
+verified the same way with `--emit-live`: guide entry, auto-open, streamed
+commands/output, session and host filters, scrolling and Clear, with zero browser
+console errors. A packaged tarball
 install is verified separately:
 
 ```sh
