@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { describe, it } from "node:test";
 
 import { boundDetail, createAuditLog } from "../../lib/audit.js";
 
@@ -114,4 +114,84 @@ test("tolerates a torn or invalid line on load", async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+describe("audit host filter, offset and count", () => {
+  /** @returns {ReturnType<typeof createAuditLog>} */
+  function seededAudit() {
+    const audit = createAuditLog({ limit: 100 });
+    audit.record({ tool: "remote_exec", host: "web-1", action: "exec", risk: "low", detail: "a" });
+    audit.record({ tool: "remote_read", host: "db-1", action: "read", risk: "read", detail: "b" });
+    audit.record({ tool: "remote_exec", host: "web-1", action: "exec", risk: "low", detail: "c" });
+    audit.record({ tool: "terminal", host: "web-1", action: "open", risk: "read", detail: "d" });
+    audit.record({ tool: "remote_exec", host: "WEB-1", action: "exec", risk: "low", detail: "e" });
+    return audit;
+  }
+
+  it("filters by exact host, newest first, and counts the matches", () => {
+    const audit = seededAudit();
+    const entries = audit.list({ host: "web-1" });
+    assert.ok(Array.isArray(entries));
+    assert.deepEqual(entries.map((entry) => entry.detail), ["d", "c", "a"]);
+    assert.equal(audit.count({ host: "web-1" }), 3);
+  });
+
+  it("is exact: no globs and no case folding", () => {
+    const audit = seededAudit();
+    assert.deepEqual(audit.list({ host: "WEB-1" }).map((entry) => entry.detail), ["e"]);
+    assert.equal(audit.count({ host: "WEB-1" }), 1);
+    assert.deepEqual(audit.list({ host: "web-*" }), []);
+    assert.equal(audit.count({ host: "web-*" }), 0);
+    assert.deepEqual(audit.list({ host: "web" }), []);
+    assert.equal(audit.count({ host: "web" }), 0);
+    assert.deepEqual(audit.list({ host: "nope" }), []);
+    assert.equal(audit.count({ host: "nope" }), 0);
+  });
+
+  it("pages with offset after filtering", () => {
+    const audit = seededAudit();
+    assert.deepEqual(
+      audit.list({ host: "web-1", limit: 2, offset: 1 }).map((entry) => entry.detail),
+      ["c", "a"],
+    );
+    assert.deepEqual(audit.list({ host: "web-1", offset: 2 }).map((entry) => entry.detail), ["a"]);
+    assert.deepEqual(audit.list({ host: "web-1", offset: 99 }), []);
+    assert.deepEqual(audit.list({ limit: 2, offset: 1 }).map((entry) => entry.detail), ["d", "c"]);
+    // The whole (unfiltered) page still reports the total through count().
+    assert.equal(audit.count(), 5);
+  });
+
+  it("stays backwards compatible with list()/list({ limit }) and count()", () => {
+    const audit = seededAudit();
+    assert.ok(Array.isArray(audit.list()));
+    assert.equal(audit.list().length, 5);
+    assert.equal(audit.list({ limit: 2 }).length, 2);
+    assert.deepEqual(audit.list({ limit: 2 }).map((entry) => entry.detail), ["e", "d"]);
+    assert.equal(audit.count(), 5);
+    assert.equal(audit.count({}), 5);
+    assert.equal(audit.count({ host: undefined }), 5);
+    assert.equal(audit.count({ host: "" }), 5);
+  });
+
+  it("falls back for invalid limit/offset values", () => {
+    const audit = seededAudit();
+    assert.equal(audit.list({ limit: 0 }).length, 5);
+    assert.equal(audit.list({ limit: -1 }).length, 5);
+    assert.equal(audit.list({ limit: 1.5 }).length, 5);
+    assert.equal(audit.list({ limit: "2" }).length, 5);
+    assert.deepEqual(audit.list({ offset: -5 }).map((entry) => entry.detail), ["e", "d", "c", "b", "a"]);
+    assert.deepEqual(audit.list({ offset: 1.5 }).map((entry) => entry.detail), ["e", "d", "c", "b", "a"]);
+  });
+
+  it("count reflects retention bounds and clear()", () => {
+    const audit = createAuditLog({ limit: 2 });
+    audit.record({ tool: "t", host: "a" });
+    audit.record({ tool: "t", host: "b" });
+    audit.record({ tool: "t", host: "a" });
+    assert.equal(audit.count({ host: "a" }), 1, "the evicted first 'a' entry is not counted");
+    assert.equal(audit.count(), 2);
+    audit.clear();
+    assert.equal(audit.count(), 0);
+    assert.equal(audit.count({ host: "a" }), 0);
+  });
 });

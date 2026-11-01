@@ -18,6 +18,8 @@ import { dirname, join } from "node:path";
 import { after, before, describe, it } from "node:test";
 
 import { Config, normalizeConfig } from "../../lib/config.js";
+import { createHostRegistry } from "../../lib/host-registry.js";
+import { createHostStore } from "../../lib/host-store.js";
 import { findHost, isHostAllowed, isHostReadonly, loadHosts } from "../../lib/hosts.js";
 import { loadSshConfig, splitConfigLine } from "../../lib/ssh-config.js";
 
@@ -601,6 +603,11 @@ describe("Config schema", () => {
       terminalScrollbackLines: 2_000,
       terminalScrollbackBytes: 2_000_000,
       terminalMaxReadBytes: 262_144,
+      hostRegistryPath: "",
+      userTerminal: true,
+      userTerminalTtlMs: 1_800_000,
+      userTerminalReconnectAttempts: 5,
+      userTerminalScrollbackBytes: 400_000,
     };
     assert.deepEqual(Config(), expected);
     assert.deepEqual(normalizeConfig({}), expected);
@@ -801,5 +808,252 @@ describe("normalizeConfig", () => {
     assert.throws(() => normalizeConfig({ knownHostsPolicy: "maybe" }), /knownHostsPolicy must be one of/);
     assert.throws(() => normalizeConfig("nope"), /config must be an object/);
     assert.throws(() => normalizeConfig([1]), /config must be an object/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.5 managed host registry merge + host store
+// ---------------------------------------------------------------------------
+
+describe("loadHosts with managed registry hosts", () => {
+  /** @returns {{ rawConfig: Record<string, unknown>, registryHosts: Record<string, unknown>[] }} */
+  function managedMergeFixture() {
+    const dir = makeCase("managed-merge");
+    const sshConfigPath = fixture(
+      dir,
+      "ssh-config",
+      `Host shared
+  HostName ssh-shared.internal
+
+Host overridden
+  HostName ssh-overridden.internal
+
+Host ssh-only
+  HostName ssh-only.internal
+`,
+    );
+    return {
+      rawConfig: {
+        sshConfigPath,
+        hosts: [
+          { name: "overridden", host: "10.0.0.99" },
+          { name: "cfg-only", host: "10.0.0.50" },
+        ],
+      },
+      registryHosts: [
+        {
+          name: "overridden",
+          host: "10.0.0.200",
+          port: 2200,
+          username: "managed-ops",
+          tags: ["managed"],
+        },
+        { name: "SHARED", host: "10.0.0.201" },
+        { name: "managed-only", host: "10.0.0.202", passwordEnv: "MANAGED_PW" },
+        { name: "cfg-only", host: "10.0.0.203" },
+      ],
+    };
+  }
+
+  it("merges managed > config > ssh-config by case-insensitive name", async () => {
+    const { rawConfig, registryHosts } = managedMergeFixture();
+    const hosts = await loadHosts(rawConfig, { registryHosts });
+
+    assert.deepEqual(
+      hosts.map((host) => host.name),
+      ["cfg-only", "managed-only", "overridden", "SHARED", "ssh-only"],
+    );
+
+    const overridden = hostNamed(hosts, "overridden");
+    assert.equal(overridden.id, "managed:overridden");
+    assert.equal(overridden.source, "managed");
+    assert.equal(overridden.managed, true);
+    assert.equal(overridden.host, "10.0.0.200", "managed beats a config host of the same name");
+    assert.equal(overridden.port, 2200);
+    assert.equal(overridden.username, "managed-ops");
+    assert.deepEqual(overridden.tags, ["managed"]);
+
+    const shared = hostNamed(hosts, "SHARED");
+    assert.equal(shared.id, "managed:SHARED");
+    assert.equal(shared.source, "managed");
+    assert.equal(shared.host, "10.0.0.201");
+    assert.equal(shared.port, 22, "managed hosts default to port 22");
+
+    assert.equal(hostNamed(hosts, "cfg-only").id, "managed:cfg-only", "managed beats config");
+    assert.equal(hostNamed(hosts, "cfg-only").host, "10.0.0.203");
+    assert.equal(hostNamed(hosts, "ssh-only").source, "ssh-config");
+
+    assert.equal(findHost(hosts, "managed:managed-only")?.name, "managed-only");
+    assert.equal(findHost(hosts, "managed-only")?.host, "10.0.0.202");
+    assert.equal(findHost(hosts, "shared")?.source, "managed", "lookup by name is case-insensitive");
+  });
+
+  it("does not let a managed host leak config-only auth fields it does not declare", async () => {
+    const hosts = await loadHosts(
+      { includeSshConfig: false, hosts: [] },
+      { registryHosts: [{ name: "box", host: "10.0.0.8", passwordEnv: "BOX_PW" }] },
+    );
+    const box = hostNamed(hosts, "box");
+    assert.equal(box.passwordEnv, "BOX_PW");
+    assert.equal(box.passphraseEnv, undefined);
+    assert.equal(box.identityFile, undefined);
+  });
+
+  it("skips malformed registry records with warnings and never throws", async () => {
+    const warnings = [];
+    const logger = { warn: (message) => warnings.push(String(message)) };
+    const registryHosts = [
+      { name: "ok-managed", host: "10.0.0.9" },
+      { name: "bad name", host: "10.0.0.9" },
+      { name: "bad-port", host: "10.0.0.9", port: 70_000 },
+      null,
+      { host: "no-name" },
+    ];
+    const hosts = await loadHosts(
+      { includeSshConfig: false, hosts: [] },
+      { registryHosts, logger },
+    );
+    assert.deepEqual(hosts.map((host) => host.name), ["ok-managed"]);
+    assert.equal(warnings.length, 4);
+    for (const message of warnings) assert.match(message, /ignoring managed host at registry\[/);
+  });
+
+  it("tolerates a missing/non-array registryHosts option", async () => {
+    for (const registryHosts of [undefined, null, "nope", 42, {}]) {
+      const hosts = await loadHosts(
+        { includeSshConfig: false, hosts: [{ name: "cfg", host: "10.0.0.1" }] },
+        { registryHosts },
+      );
+      assert.deepEqual(hosts.map((host) => host.name), ["cfg"]);
+      assert.equal(hosts[0].source, "config");
+    }
+  });
+
+  it("applies readonlyHosts globs to managed hosts", async () => {
+    const hosts = await loadHosts(
+      { includeSshConfig: false, hosts: [], readonlyHosts: ["managed-*"] },
+      {
+        registryHosts: [
+          { name: "managed-box", host: "10.0.0.7" },
+          { name: "other", host: "10.0.0.8" },
+        ],
+      },
+    );
+    assert.equal(hostNamed(hosts, "managed-box").readonly, true);
+    assert.equal(hostNamed(hosts, "other").readonly, undefined);
+    assert.equal(isHostReadonly(hostNamed(hosts, "managed-box"), { readonlyHosts: [] }), true);
+  });
+
+  it("accepts records created by the real registry (round trip)", async () => {
+    const dir = makeCase("managed-round-trip");
+    const registry = createHostRegistry({ filePath: join(dir, "remote", "hosts.json") });
+    await registry.create({
+      name: "ui-added",
+      host: "10.8.0.1",
+      port: 2222,
+      username: "ops",
+      tags: ["ui"],
+    });
+
+    const hosts = await loadHosts(
+      { includeSshConfig: false, hosts: [] },
+      { registryHosts: registry.list() },
+    );
+    const added = hostNamed(hosts, "ui-added");
+    assert.equal(added.id, "managed:ui-added");
+    assert.equal(added.source, "managed");
+    assert.equal(added.managed, true);
+    assert.equal(added.port, 2222);
+    assert.deepEqual(added.tags, ["ui"]);
+  });
+});
+
+describe("createHostStore with a managed registry", () => {
+  const record = { name: "managed-box", host: "10.0.0.7", managed: true };
+
+  /** @returns {{ state: { loads: number }, registry: { load: () => Promise<void>, list: () => unknown[] } }} */
+  function fakeRegistry() {
+    const state = { loads: 0 };
+    return {
+      state,
+      registry: {
+        load: async () => {
+          state.loads += 1;
+        },
+        list: () => [record],
+      },
+    };
+  }
+
+  /**
+   * @param {ReturnType<typeof fakeRegistry>["registry"]} registry
+   * @param {{ warn?: (message: string) => void }} [logger]
+   * @returns {{ store: ReturnType<typeof createHostStore>, calls: Array<[unknown, unknown]>, loads: () => number }}
+   */
+  function trackedStore(registry, logger) {
+    const calls = [];
+    let count = 0;
+    const load = async (...args) => {
+      count += 1;
+      calls.push(args);
+      return [{ id: "managed:managed-box", name: "managed-box", host: "10.0.0.7", port: 22, source: "managed" }];
+    };
+    return { store: createHostStore({ config: { allowHosts: [] }, logger, registry, load }), calls, loads: () => count };
+  }
+
+  it("awaits registry.load() and passes its records to loadHosts", async () => {
+    const { state, registry } = fakeRegistry();
+    const { store, calls } = trackedStore(registry);
+    const hosts = await store.list();
+    assert.equal(state.loads, 1, "registry.load() is awaited before discovery");
+    assert.deepEqual(calls[0][1].registryHosts, [record], "registry records are passed to loadHosts");
+    assert.equal(hosts[0].source, "managed");
+  });
+
+  it("caches, honors refresh, and reloads after invalidate()", async () => {
+    const { state, registry } = fakeRegistry();
+    const { store, loads } = trackedStore(registry);
+
+    await store.list();
+    assert.equal(loads(), 1);
+    await store.list();
+    assert.equal(loads(), 1, "a second call inside the TTL uses the cache");
+    await store.list({ refresh: true });
+    assert.equal(loads(), 2, "refresh bypasses the cache");
+    store.invalidate();
+    await store.list();
+    assert.equal(loads(), 3, "invalidate() forces the next list() to reload");
+    assert.equal(state.loads, 3, "the registry is re-read on every reload");
+  });
+
+  it("tolerates a registry whose load() rejects", async () => {
+    const warnings = [];
+    const registry = {
+      load: async () => {
+        throw new Error("registry exploded");
+      },
+      list: () => [record],
+    };
+    const { store } = trackedStore(registry, { warn: (message) => warnings.push(String(message)) });
+    const hosts = await store.list();
+    assert.equal(hosts.length, 1, "discovery still runs with the registry records");
+    assert.ok(warnings.some((message) => /managed host registry load failed/.test(message)));
+  });
+
+  it("stays backwards compatible without a registry", async () => {
+    const calls = [];
+    const load = async (...args) => {
+      calls.push(args);
+      return [];
+    };
+    const store = createHostStore({ config: { allowHosts: ["prod-*"] }, load });
+    await store.list();
+    assert.deepEqual(calls[0][0], { allowHosts: ["prod-*"] });
+    assert.equal(calls[0][1].registryHosts, undefined);
+    assert.equal(store.isAllowed({ name: "prod-web-1" }), true);
+    assert.equal(store.isAllowed({ name: "db-1" }), false);
+    assert.equal(store.isReadonly({ name: "prod-web-1" }), false);
+    await assert.rejects(store.find("missing"), (error) => /** @type {any} */ (error).code === "UNKNOWN_HOST");
+    assert.equal(typeof (await store.fingerprint()), "string");
   });
 });

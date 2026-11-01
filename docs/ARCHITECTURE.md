@@ -827,3 +827,370 @@ command of the session).
   scrolled-up freeze + jump back, and Clear; it fails non-zero on any
   console.error/pageerror/HTTP≥400. `docs/assets/remote-terminal.png` is the
   captured result; browser diagnostics were empty.
+
+## Interactive user SSH terminal + host management (v0.5)
+
+Six product requirements drive this version:
+
+1. The right-sidebar terminal selects an available host and auto-creates the connection.
+2. The user types commands in that terminal (not only watches the agent).
+3. The host list supports quick connect: create the SSH connection, then open the
+   conversation so the agent takes over operations.
+4. The host list gains an actions column with a per-host audit button.
+5. The Remote Ops page gains a host management entry (add/edit/delete connection
+   info), modeled on Crescent's connection manager.
+6. The terminal stays a real interactive terminal; one SSH session is reused per
+   conversation and an SSH drop recovers automatically.
+
+**Decision (user-confirmed):** the interactive terminal is DSH's own native
+terminal (real xterm), not a second emulator inside the plugin panel. The
+plugin's `dsh-remote-live` panel becomes the launcher/console: host picker,
+session list, and the existing agent-command mirror.
+
+### Files and ownership (v0.5)
+
+| Path | Owner | Purpose |
+| --- | --- | --- |
+| `lib/host-registry.js` | hosts | persisted managed hosts CRUD (`$DSH_HOME/remote/hosts.json`) |
+| `lib/hosts.js`, `lib/host-store.js` | hosts | merge registry hosts (`source: "managed"`), cache invalidation |
+| `lib/audit.js` | hosts | host-filtered listing (`list({host,limit,offset})`, `count({host})`) |
+| `lib/terminal/relay.js` | terminal | per-conversation SSH PTY session relay + local socket server + reconnect |
+| `lib/terminal/bridge.cjs`, `bin/dsh-remote-terminal` | terminal | local bridge process run inside the native terminal |
+| `test/unit/host-registry.test.mjs`, `test/unit/relay.test.mjs` | owners | unit coverage |
+| `test/integration/relay.test.mjs` | terminal | real fixture SSH server + bridge child process |
+| `lib/api.js`, `lib/index.js`, `lib/config.js`, `package.json` | lead | API methods, wiring, config, packaging |
+| `lib/client.js` | client | panel + management page UI, native-terminal opener, quick connect |
+| `scripts/dev-web-test.mjs`, `scripts/sync-profile.sh` | lead | browser verification, profile sync (bin/) |
+| `README.md`, this document | lead | user docs + contracts |
+
+Nobody edits another owner's files. Cross-owner behavior goes through the
+contracts below.
+
+### Managed host registry — `lib/host-registry.js`
+
+```js
+import { createHostRegistry } from "./host-registry.js";
+const registry = createHostRegistry({ filePath, logger });
+await registry.load();                       // best effort, empty on missing/corrupt file
+registry.list()                              // ManagedHost[] (cached, sorted by name)
+registry.get(name)                           // ManagedHost | undefined
+await registry.create(input)                 // -> ManagedHost, validates + atomic write
+await registry.update(name, input)           // -> ManagedHost
+await registry.delete(name)                  // -> boolean
+registry.filePath
+```
+
+`ManagedHost` (persisted record; never contains a secret value):
+
+```js
+{
+  name: "prod-web-1",            // required, unique (case-insensitive), /^[A-Za-z0-9._-]{1,64}$/
+  host: "10.0.0.11",             // required, no whitespace, <=255
+  port: 22,                      // optional int 1..65535
+  username: "ops",               // optional /^[A-Za-z0-9._-]{1,64}$/
+  identityFile: "~/.ssh/prod",   // optional path (no secrets)
+  passwordEnv: "PROD_PW",        // optional env-var NAME /^[A-Za-z_][A-Za-z0-9_]*$/
+  passphraseEnv: "PROD_KEY_PW",  // optional env-var NAME
+  proxyJump: ["bastion"],        // optional string or string[]; entries user@host[:port]
+  tags: ["prod", "web"],         // optional <=16 entries, each <=32 chars
+  description: "primary web",    // optional <=200 chars
+  managed: true,                 // always true in the registry; added by the store
+  createdAt: 1730000000000,
+  updatedAt: 1730000000000
+}
+```
+
+Rules:
+- Persisted file format `{ "version": 1, "hosts": [ManagedHost…] }`, written
+  atomically (temp file in the same dir + rename, mode 0600). Missing file is
+  empty; a corrupt file warns and yields `[]` (never throws at load).
+- Input validation rejects unknown `password`/`passphrase`/`secret`/`token`
+  keys: only environment-variable NAMES are accepted, never values.
+- `create` on an existing name (case-insensitive) → error `code: "HOST_EXISTS"`.
+- `update`/`delete` on a missing name → `code: "HOST_NOT_FOUND"`.
+- `load()` is idempotent; mutations update the in-memory list and the file.
+
+Host merge (`lib/hosts.js`): `loadHosts(config, { homeDir, logger, registryHosts })`
+merges in this priority by name: registry (`source: "managed"`, ids `managed:<name>`)
+> plugin config (`source: "config"`) > `~/.ssh/config` (`source: "ssh-config"`).
+`RemoteHost.source` becomes `"ssh-config" | "config" | "managed"`. Config hosts
+still win over ssh-config. Registry hosts are validated the same way as config
+hosts, so a malformed record never breaks discovery (skip + warn).
+`host-store.js` accepts `{ registry }`: `list()` awaits `registry.load()` once,
+passes the records to `loadHosts`, and exposes `invalidate()` (called by the API
+after a mutation so the next tool call sees the new list).
+
+### Audit host filter — `lib/audit.js`
+
+- `list({ limit = 200, offset = 0, host } = {})` → entries (newest first),
+  filtered by exact `entry.host === host` when `host` is given. Backwards
+  compatible: no argument/limit-only keeps returning the array.
+- `count({ host } = {})` → matching entry count.
+- Relay lifecycle events are recorded as
+  `{ tool: "terminal", host, action: "open" | "reconnect" | "close", risk: "read", outcome: "ok", detail }`.
+  User keystrokes are never recorded (they may contain passwords typed at a
+  `sudo`/password prompt).
+
+### Relay + bridge — `lib/terminal/relay.js`, `lib/terminal/bridge.cjs`
+
+The relay lives in the DSH Host process. It owns one SSH PTY per
+`(conversation session id, host)` and serves the native terminal through a local
+socket. The bridge process (spawned *inside* the DSH terminal by typing a
+command into a fresh shell) connects to that socket and pipes raw bytes; xterm
+renders the real remote terminal.
+
+```js
+import { createTerminalRelay } from "./terminal/relay.js";
+const relay = createTerminalRelay({ transport, hosts, config, audit, logger, socketPath? });
+await relay.start();                       // net server on the socket (idempotent)
+const opened = await relay.open({ hostName, sessionId, cols?, rows? });
+// { shell: { command, sessionKey, socketPath, host: {name, target} },
+//   session: TerminalSessionView }
+relay.list({ sessionId? })                 // TerminalSessionView[]
+await relay.close(sessionKey)              // -> boolean
+await relay.dispose()                      // close server + every session (quiescent)
+relay.sessionKeyFor(sessionId, hostName)   // `${sessionId}::${hostName}`
+relay.socketPath
+```
+
+`TerminalSessionView` (JSON-safe; never raw buffers):
+
+```js
+{
+  sessionKey, host: "prod-web-1", target: "ops@10.0.0.11:22", sessionId: "<conversation>",
+  state: "connecting" | "connected" | "reconnecting" | "closed" | "error",
+  attached: 0,                 // connected bridge clients
+  reconnectAttempt: 0,
+  cols: 120, rows: 40,
+  createdAt, updatedAt,
+  lastError: null | string,
+  bytesOut: 0,                 // total bytes forwarded from the PTY (bounded counter)
+}
+```
+
+Behavior:
+- `open` reuses a live session for the same key (this is the per-conversation SSH
+  reuse); a closed/errored session is replaced. It resolves the host through
+  `hosts.find`, rejects a disallowed (`allowHosts`) host with `code: "HOST_DISALLOWED"`,
+  and opens `transport.openPty(host, { cols, rows, term: "xterm-256color" })`.
+- Output: every PTY text chunk is appended to a bounded replay buffer
+  (`userTerminalScrollbackBytes`, default 400 000) and broadcast to attached
+  bridges. A new bridge gets `ESC[2J ESC[3J ESC[H` + the replay tail first.
+- Auto-reconnect: an unexpected PTY exit/socket error sets `reconnecting`, writes
+  a yellow banner into the stream, and retries with backoff 1s/2s/4s/8s/16s/30s
+  up to `userTerminalReconnectAttempts` (default 5). A successful retry opens a
+  new PTY, sets `connected`, writes `[dsh-remote] SSH 连接已恢复`, and keeps the
+  bridge attached. Exhausted attempts → `error` + final banner.
+- A bridge disconnect does not close the session. After the last bridge detaches,
+  `userTerminalTtlMs` (default 1 800 000; 0 disables) starts; expiry closes the
+  session (audit `close`). `close()` closes the PTY channel only.
+- Socket: `$DSH_HOME/remote/terminal.sock` (dir 0700, socket 0600) on POSIX;
+  `\\.\pipe\dsh-remote-terminal-<sha1 of DSH_HOME>` on Windows. A stale socket
+  file is unlinked after verifying it is a socket; a second listener start on a
+  live socket reuses it.
+- Wire protocol (socket): the bridge opens the connection and sends exactly one
+  JSON line handshake `{"v":1,"host":"<name>","sessionId":"<id>"}\n`; the server
+  attaches (replay first) and then only raw UTF-8 PTY text flows server→bridge.
+  Bridge→server frames are newline-delimited JSON:
+  `{"t":"i","d":"<base64 utf8>"}` (input), `{"t":"r","c":<cols>,"r":<rows>}` (resize),
+  `{"t":"c"}` (close request). Malformed frames are ignored; a disallowed host
+  closes the socket. Handshake timeout 10s, session idle TTL as above.
+
+`bin/dsh-remote-terminal` (POSIX shell, executable, packaged) resolves a node
+binary (`$DSH_REMOTE_NODE`, then `node` on PATH, then a few common locations)
+and `exec`s `lib/terminal/bridge.cjs`, forwarding all arguments. The bridge
+(`bridge.cjs`, CommonJS, node builtins only):
+
+```
+--host <name> --session <id> --socket <path>
+```
+
+- Clears the screen, connects, sends the handshake, sets `stdin` raw (TTY only),
+  pipes stdin→`{"t":"i"}` frames and server text→stdout, forwards SIGWINCH as a
+  resize frame, and restores the terminal on exit.
+- On socket close/error it prints `[dsh-remote] 终端桥接断开，正在重连…` and retries
+  every 1s (bounded to 120 attempts) so a DSH Host restart also recovers; on
+  stdin EOF / SIGINT / SIGTERM it exits cleanly.
+- `relay.open().shell.command` is the exact shell line the client types into the
+  native terminal:
+  `exec <quoted bin path> --host <quoted> --session <quoted> --socket <quoted>`.
+
+### Host HTTP API additions — `lib/api.js`
+
+Same route `/dsh-remote/api`, POST `{method,…}`, same fence/limits. Adds:
+
+| method | params | result |
+| --- | --- | --- |
+| `host.create` | `{ host: ManagedHostInput }` | `{ host: HostView }` |
+| `host.update` | `{ name, host: ManagedHostInput }` | `{ host: HostView }` |
+| `host.delete` | `{ name }` | `{ deleted: true }` |
+| `audit.list` | `{ host?, limit?, offset? }` | `{ host, total, entries: AuditEntry[] }` |
+| `terminal.open` | `{ name, sessionId? }` | `{ shell, session }` |
+| `terminal.list` | `{ sessionId? }` | `{ sessions: TerminalSessionView[] }` |
+| `terminal.close` | `{ sessionKey }` | `{ closed: true }` |
+
+- `overview` gains `terminal: { enabled, available, socketPath, sessions }` and
+  every `HostView` gains `managed: boolean` plus the secret-free connection
+  fields the edit form prefills: `identityFile`, `passwordEnv`, `passphraseEnv`
+  (environment-variable NAMES only) and `proxyJump: string[]`. Existing fields
+  stay.
+- Error codes (HTTP 400 unless noted): `HOST_INVALID`, `HOST_EXISTS` (409),
+  `HOST_NOT_FOUND` (404), `HOST_NOT_MANAGED` (400), `HOST_DISALLOWED` (403),
+  `TERMINAL_DISABLED`, `TERMINAL_NOT_FOUND` (404), `TERMINAL_ERROR` (500),
+  `AUDIT_INVALID`. Registry mutation invalidates the host store.
+- Config additions in `lib/config.js`: `userTerminal` (default true),
+  `userTerminalTtlMs` (1 800 000), `userTerminalReconnectAttempts` (5),
+  `userTerminalScrollbackBytes` (400 000), `hostRegistryPath` (default
+  `$DSH_HOME/remote/hosts.json`). `lib/index.js` creates the registry + relay,
+  loads the registry lazily, wires them into the API/audit/tools, and disposes
+  the relay with the plugin.
+
+### Browser half — `lib/client.js`
+
+**Native terminal opener** (module-private helper; feature-detected so the page
+still works without the terminal plugins):
+
+```js
+// runtimeCtx = the client plugin's root context captured in apply()
+async function openNativeTerminal(sessionId, command) {
+  const right = runtimeCtx.sidebarRight, terminals = runtimeCtx.webTerminals;
+  if (!right || !terminals || typeof right.openTabIn !== "function") throw new Error("终端服务不可用");
+  const tabs = right.openTabs;                       // snapshot store
+  const before = new Set((tabs.getSnapshot() ?? []).map((tab) => tab.id));
+  right.openTabIn(sessionId, "terminal", {});        // DSH's native terminal type
+  const tabId = await waitFor(() => (tabs.getSnapshot() ?? [])
+    .find((tab) => tab.kind === "terminal" && !before.has(tab.id)), 5000);
+  const nav = right.tabDomain.occurrence(sessionId, { id: tabId }).navigation.getSnapshot();
+  const view = terminals.view(sessionId, tabId, nav.address, undefined, undefined);
+  await waitForState(view, (state) => state.writable === true, 20000);
+  view.write(command + "\r");
+}
+```
+
+**Quick connect / conversation handoff** (used by the page actions column and
+the panel buttons):
+
+```js
+const opened = await callApi("terminal.open", { name, sessionId });   // creates/reuses the SSH PTY
+await openNativeTerminal(sessionId, opened.result.shell.command);
+const scope = runtimeCtx.sessions.scope(sessionId);
+const conversation = scope?.conversation ?? scope?.get?.("conversation");
+await conversation.send(`已连接远程主机 ${name}（${target}）。请在当前对话里继续这台主机的运维：先做一次只读健康检查（hostname、uptime、磁盘、内存、负载），再等我的指令。`);
+```
+
+- The management page resolves the on-screen session from
+  `runtimeCtx.uiSession.current.getSnapshot()` (`sessionId` / `key` /
+  `session.sessionId`); with no session it still opens the terminal and shows a
+  notice instead of sending a message.
+- The panel (session-scoped `props.sessionId`) always injects.
+- Never send the message when `openNativeTerminal` failed; show the error inline.
+
+**Remote Terminal panel (`RemoteTerminalPanel`)** — keeps the v0.4 mirror and adds:
+- A host picker (`select`, `data-remote-terminal-host`) fed by the overview hosts.
+- Buttons `打开终端` (`data-terminal-action="open"`) and `连接并对话`
+  (`data-terminal-action="talk"`).
+- A session list from `overview.terminal.sessions` with host, state label,
+  attached count, `打开` (`data-terminal-action="attach"`) and `关闭`
+  (`data-terminal-action="close"`). `打开` re-calls `terminal.open` (same key) and
+  reattaches a native terminal to the live session.
+- Existing data attributes (`data-dsh-remote-live`, `data-live-connection`,
+  `data-live-command-id`, `.dslt-log`, `.dslt-btn`, filters) stay for v0.4 tests.
+
+**Remote Ops management page (`RemoteOpsPage`)**:
+- Header gains `添加主机` (`data-host-action="create"`).
+- Hosts table gains an 操作 column with per-row buttons
+  `连接` (`data-host-action="connect"`), `审计` (`data-host-action="audit"`),
+  `编辑` (`data-host-action="edit"`, managed hosts only), `删除`
+  (`data-host-action="delete"`, managed hosts only), each carrying
+  `data-host-name`. The existing per-row `测试连接` stays.
+- Host form modal (`data-dsh-remote-host-form`): fields `name`, `host`, `port`,
+  `username`, `identityFile`, `passwordEnv`, `passphraseEnv`, `proxyJump`
+  (comma separated), `tags` (comma separated), `description`; inline validation
+  error; hints that auth values are environment-variable NAMES, not secrets,
+  and that `~/.ssh/config` hosts are read-only here.
+- Audit modal (`data-dsh-remote-audit`, rows `data-audit-entry`): fetch
+  `audit.list { host }`, show time/tool/action/risk/outcome/duration/detail,
+  refresh + close; empty state when the host has no recorded operations.
+- The page refreshes the overview every 10s; a mutation triggers an immediate
+  refresh.
+
+### Verification contract (v0.5)
+
+- `npm test` keeps passing and adds unit coverage for the registry, audit host
+  filter, relay (reuse, replay, reconnect, TTL) and integration coverage for the
+  real fixture SSH server through the relay + bridge child process.
+- `scripts/dev-web-test.mjs` gains `--remote-terminal`: boots the isolated Web
+  profile with a fixture SSH host in the plugin config, starts the fixture SSH
+  server, clicks `连接` for that host, waits for the native terminal tab, types
+  `printf 'terminal-ok\n'`, asserts the output plus the injected user message,
+  exercises the audit modal (the agent-run commands appear under the host), the
+  host form (create/edit/delete round-trip) and captures updated screenshots.
+- `docs/assets/management-page.png` and `docs/assets/remote-terminal.png` are
+  regenerated by that run.
+- A packaged tarball install must include `bin/` and `lib/terminal/bridge.cjs`.
+
+### v0.5 implementation notes (as verified)
+
+These are the deliberate deltas from the v0.5 contract above; all are additive
+or compatible, and the full suite plus the real browser run agree with them.
+
+- **Managed-host registry.** `lib/host-registry.js` returns defensive copies,
+  writes `{version:1,hosts:[…]}` atomically (temp+rename, file 0600, dir 0700),
+  serializes mutations with in-memory rollback, accepts integer strings for
+  `port` and comma-separated strings for `proxyJump`/`tags`, treats empty
+  optional strings as unset, ignores unknown non-secret keys, and rejects raw
+  `password`/`passphrase`/`secret`/`token` keys with `HOST_INVALID`. `delete()`
+  on a missing name throws `HOST_NOT_FOUND` (the API maps a missing *managed*
+  name that exists in the merged list to `HOST_NOT_MANAGED`), and `update()`
+  supports rename while keeping the current name when omitted.
+- **Host merge.** Managed hosts carry `source: "managed"`, `id: "managed:<name>"`
+  and `managed: true`. `createHostStore({registry})` awaits `registry.load()`
+  before discovery and exposes `invalidate()` with a generation guard so an
+  in-flight discovery cannot repopulate a stale cache.
+- **Relay split.** The socket server lives in a separate internal helper
+  `lib/terminal/relay-socket.js` (handshake, framing, stale-vs-live socket
+  handling, `unref()`ed listener) to keep `lib/terminal/relay.js` under the
+  ~700-line convention; `relay.js` re-exports the public helpers, so
+  `import { createTerminalRelay } from "./terminal/relay.js"` is unchanged.
+  A live socket is probed and reused, never unlinked; a second instance on the
+  same path gets `start()` success but `open()` fails `TERMINAL_ERROR`. Failed
+  `open()` promises settle to the entry (never reject unhandled) — otherwise a
+  single unreachable host would crash the Host process on Node 22.
+- **API facade.** `lib/index.js` passes the API a thin relay facade
+  (`{enabled, available, socketPath, start, open, list, close}`) so `overview`
+  can report/retry availability. `terminal.open` maps relay `HOST_DISALLOWED` to
+  HTTP 403 and the host store's `UNKNOWN_HOST` to `HOST_NOT_FOUND` 404; a failed
+  PTY open is a structured `TERMINAL_ERROR` 500 and never takes the process down.
+- **Native terminal opener (browser).** Two shape facts differ from the sketch:
+  `ctx.sidebarRight.openTabs` publishes `{sessionId, tabId, kind, contentId}`
+  (not `tab.id`; the client normalizes `tabId || id`), and the main column must
+  first show the conversation — `ctx.uiWorkspace.openSession(sessionId)` +
+  `sidebarRight.mounted` poll — or the terminal tab's seat never mounts while a
+  root panel page (the Remote Ops page) owns the main view. The client also waits
+  for `webTerminals.view(...).state.writable` before writing the bridge command.
+- **Conversation handoff.** The page action `连接` and the panel action
+  `连接并对话` open the terminal first and only then send the scoped
+  `conversation.send(...)`; a failed terminal never injects. The panel's
+  `打开终端` is terminal-only, and `打开` on a session row re-calls
+  `terminal.open` (same key → same SSH PTY) without injecting.
+- **OpenTabs/terminal typing.** The bridge receives the command as one shell
+  line (`exec "<abs>/bin/dsh-remote-terminal" --host … --session … --socket …`),
+  so no `api-terminal-controller` shell/profile config patch is needed; the
+  launcher resolves node (`$DSH_REMOTE_NODE` → PATH → common locations) and the
+  socket is user-only (`$DSH_HOME/remote/terminal.sock`, dir 0700, socket 0600).
+- **Verification environment.** The browser loop must run where the DSH Host may
+  allocate a POSIX PTY (running it inside an agent file sandbox fails with
+  `posix_openpt failed: Operation not permitted`); `scripts/dev-web-test.mjs
+  --remote-terminal` boots the isolated Web profile with a real SSH fixture host
+  and covers actions column, quick connect, native terminal typing + output,
+  conversation handoff, per-host audit modal, host-manager add/delete and
+  per-conversation session reuse. `--docs-shots` writes both README screenshots.
+- **Verified (v0.5).** `npm test` → **642 tests, 642 pass** (unit + real-fixture
+  integration, ~11 s). `node scripts/dev-web-test.mjs --remote-terminal
+  --docs-shots` against the isolated Web profile with a real fixture SSH host →
+  **PASS** with zero failures and zero browser console/HTTP diagnostics: actions
+  column, quick connect (relay PTY + native terminal mount), typed
+  `printf 'terminal-ok\n'` → `terminal-ok`, `已连接远程主机 termbox（…）` handoff,
+  per-host audit modal with the `terminal termbox open` event, host-manager
+  add/delete round-trip, and second `terminal.open` returning the same
+  `sessionKey`; both `docs/assets/*.png` regenerated by that run.

@@ -1,0 +1,82 @@
+#!/bin/sh
+# dsh-remote-terminal — local bridge launcher for the interactive SSH terminal.
+#
+# The DSH browser client types the line produced by relay.open() into a fresh
+# native terminal:
+#
+#   exec '<abs>/bin/dsh-remote-terminal' --host '<name>' --session '<id>' --socket '<path>'
+#
+# This script resolves a node binary and execs the CommonJS bridge next to it,
+# forwarding every argument untouched. It must work from a plain interactive
+# shell with no extra environment, so it tries $DSH_REMOTE_NODE, `node` on PATH,
+# then a few common install locations.
+set -u
+
+# --- locate this script (resolve symlinks via the real directory) -----------
+script=$0
+# Follow a symlinked launcher to its target; `readlink` is not POSIX, so guard it.
+if command -v readlink >/dev/null 2>&1; then
+  hops=0
+  while [ -L "$script" ] && [ "$hops" -lt 40 ]; do
+    hops=$((hops + 1))
+    target=$(readlink "$script") || break
+    case $target in
+      /*) script=$target ;;
+      *) script=$(dirname "$script")/$target ;;
+    esac
+  done
+fi
+case $script in
+  */*) ;;
+  *)
+    script=$(command -v "$script" 2>/dev/null || printf '%s' "$script")
+    ;;
+esac
+case $script in
+  */*) ;;
+  *)
+    printf 'dsh-remote-terminal: cannot locate the launcher script (%s)\n' "$0" >&2
+    exit 127
+    ;;
+esac
+script_dir=$(CDPATH= cd -P "$(dirname "$script")" 2>/dev/null && pwd -P) || {
+  printf 'dsh-remote-terminal: cannot resolve the launcher directory (%s)\n' "$0" >&2
+  exit 127
+}
+bridge=$script_dir/../lib/terminal/bridge.cjs
+
+if [ ! -f "$bridge" ]; then
+  printf 'dsh-remote-terminal: bridge not found at %s\n' "$bridge" >&2
+  exit 127
+fi
+
+# --- locate node ------------------------------------------------------------
+node_bin=${DSH_REMOTE_NODE:-}
+if [ -z "$node_bin" ]; then
+  node_bin=$(command -v node 2>/dev/null || true)
+fi
+if [ -z "$node_bin" ]; then
+  for candidate in \
+    /opt/homebrew/bin/node \
+    /usr/local/bin/node \
+    /usr/bin/node \
+    /opt/local/bin/node \
+    /snap/bin/node \
+    "$HOME/.local/bin/node" \
+    "$HOME/.nvm/versions/node"/*/bin/node; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+      node_bin=$candidate
+      break
+    fi
+  done
+fi
+if [ -z "$node_bin" ]; then
+  printf 'dsh-remote-terminal: no node binary found (set DSH_REMOTE_NODE)\n' >&2
+  exit 127
+fi
+if [ ! -x "$node_bin" ]; then
+  printf 'dsh-remote-terminal: node is not executable: %s\n' "$node_bin" >&2
+  exit 127
+fi
+
+exec "$node_bin" "$bridge" "$@"

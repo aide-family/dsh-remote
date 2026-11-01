@@ -21,11 +21,13 @@
  * page errors, failed HTTP responses, and failed assertions exit non-zero.
  */
 import { spawn, execFileSync } from "node:child_process";
-import { access, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { chromium } from "playwright-core";
+
+import { startSshServer } from "../test/fixtures/ssh-server.mjs";
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const DSH_HOME = join(REPO, ".dsh-test");
@@ -89,6 +91,8 @@ let waitMs = 3000;
 let port = 53991;
 let keep = false;
 let emitLive = false;
+let remoteTerminal = false;
+let docsShots = false;
 for (let i = 0; i < args.length; i += 1) {
   const arg = args[i];
   if (arg === "--click") clicks.push(args[++i]);
@@ -97,8 +101,18 @@ for (let i = 0; i < args.length; i += 1) {
   else if (arg === "--port") port = Number(args[++i]);
   else if (arg === "--keep") keep = true;
   else if (arg === "--emit-live") emitLive = true;
+  else if (arg === "--remote-terminal") remoteTerminal = true;
+  else if (arg === "--docs-shots") docsShots = true;
   else if (!arg.startsWith("--")) out = arg;
 }
+const explicitPng = process.argv.slice(2).some((value) => !value.startsWith("--") && value.endsWith(".png"));
+if (remoteTerminal && !explicitPng) {
+  out = join(REPO, "docs", "assets", "management-page.png");
+}
+if (docsShots && !remoteTerminal && !explicitPng) {
+  out = join(REPO, ".cache", "shots", "docs-initial.png");
+}
+const TERMINAL_SHOT = join(REPO, "docs", "assets", "remote-terminal.png");
 
 /** Console messages / page errors / HTTP failures that must fail the run. */
 function isBrowserError(line) {
@@ -425,6 +439,280 @@ async function verifyLiveClear(page) {
   return failures;
 }
 
+
+
+/** Dismiss first-run overlays (preview notes, guide masks) that cover the UI. */
+async function dismissOverlays(page) {
+  for (const dismissLabel of ["继续", "知道了", "开始使用", "跳过", "关闭"]) {
+    const button = page.getByRole("button", { name: dismissLabel, exact: false }).first();
+    try {
+      if ((await button.count()) > 0 && (await button.isVisible())) {
+        await button.click({ force: true });
+        await page.waitForTimeout(500);
+      }
+    } catch {
+      /* not an overlay */
+    }
+  }
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.waitForTimeout(300);
+}
+
+
+/**
+ * Capture the documentation screenshot of the interactive terminal without the
+ * quick-connect handoff (so the docs image shows the clean terminal + panel, not
+ * the test profile's missing-model-key error). Reloads the page first, then
+ * opens the 远程终端 panel, picks the fixture host and types `whoami; uname -sr`.
+ */
+async function captureDocsTerminalShot(page, url) {
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+  await page.waitForTimeout(1800);
+  await dismissOverlays(page);
+  const expand = page.locator("[data-sidebar-right-expand]").first();
+  if ((await expand.count()) > 0) {
+    await expand.click({ force: true });
+    await page.waitForTimeout(1000);
+  }
+  if ((await page.locator("[data-dsh-remote-live]").count()) === 0) {
+    const guide = page.locator('[data-sidebar-right-guide-entry="dsh-remote-live"]').first();
+    if ((await guide.count()) > 0) {
+      await guide.click({ force: true });
+      await page.waitForTimeout(1200);
+    }
+  }
+  const picker = page.locator("[data-remote-terminal-host]").first();
+  await picker.waitFor({ state: "visible", timeout: 10_000 });
+  await picker.selectOption("termbox");
+  await page.locator('[data-terminal-action="open"]').first().click({ force: true });
+  const terminal = page.locator("[data-sidebar-terminal]").first();
+  await terminal.waitFor({ state: "visible", timeout: 25_000 });
+  const ready = await waitForCondition(
+    async () => (await terminal.innerText()).includes("fixture-shell-ready"),
+    30_000,
+  );
+  if (!ready) console.warn("docs-shots: fixture shell did not become ready");
+  const screen = page.locator("[data-sidebar-terminal] .xterm-screen").first();
+  await screen.click({ force: true });
+  await page.keyboard.type("whoami; uname -sr", { delay: 20 });
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(1500);
+  await mkdir(dirname(TERMINAL_SHOT), { recursive: true });
+  await page.screenshot({ path: TERMINAL_SHOT });
+  console.log(`docs-shots: wrote ${TERMINAL_SHOT}`);
+}
+
+/** Poll `fn` until truthy or the timeout expires. @returns {Promise<boolean>} */
+async function waitForCondition(fn, timeoutMs) {
+  const started = Date.now();
+  for (;;) {
+    let value = false;
+    try {
+      value = await fn();
+    } catch {
+      value = false;
+    }
+    if (value) return true;
+    if (Date.now() - started > timeoutMs) return false;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+}
+
+/**
+ * v0.5 interactive-terminal verification: quick connect from the host list opens
+ * a real DSH native terminal over the relay (fixture SSH server), the user types,
+ * the conversation handoff fires, the per-host audit modal lists the session,
+ * and the host manager form round-trips a managed host.
+ * @returns {Promise<string[]>} failures (empty when everything behaved)
+ */
+async function verifyRemoteTerminal(page) {
+  const failures = [];
+  const bodyText = () => page.locator("body").innerText();
+  await dismissOverlays(page);
+
+  // 1. Open the Remote Ops management page from the sidebar.
+  const entry = page.getByText("远程运维", { exact: false }).first();
+  try {
+    await entry.waitFor({ state: "visible", timeout: 15_000 });
+    await entry.click({ force: true });
+  } catch {
+    failures.push("the Remote Ops sidebar entry is missing");
+  }
+  await page.waitForTimeout(1500);
+
+  // 2. The fixture host row must expose the actions column.
+  const connect = page.locator('[data-host-action="connect"][data-host-name="termbox"]').first();
+  try {
+    await connect.waitFor({ state: "visible", timeout: 15_000 });
+  } catch {
+    failures.push('the host actions column has no 连接 button for host "termbox"');
+  }
+  if (failures.length > 0) return failures;
+
+  // 3. Quick connect: opens the DSH native terminal attached to the relay.
+  await connect.click({ force: true });
+  await page.waitForTimeout(3000);
+  const connectDiag = await page.evaluate(function readConnectDiagnostics() {
+    const notice = document.querySelector("[data-dsh-remote-notice]");
+    const right = document.querySelector("[data-sidebar-right-panel]");
+    return {
+      notice: notice === null ? null : notice.textContent,
+      noticeKind: notice === null ? null : notice.getAttribute("data-kind"),
+      terminalBodies: document.querySelectorAll("[data-sidebar-terminal]").length,
+      rightExpanded: right !== null && right.getAttribute("data-sidebar-right-open") !== null,
+      rightText: right === null ? null : right.textContent.slice(0, 400),
+    };
+  });
+  console.log(`remote-terminal: connect diagnostics ${JSON.stringify(connectDiag)}`);
+  const terminal = page.locator("[data-sidebar-terminal]").first();
+  try {
+    await terminal.waitFor({ state: "visible", timeout: 25_000 });
+  } catch {
+    failures.push("the native DSH terminal tab did not open after 连接");
+  }
+  await page.waitForTimeout(1200);
+  const shellReady = await waitForCondition(
+    async () => (await terminal.innerText()).includes("fixture-shell-ready"),
+    30_000,
+  );
+  if (!shellReady) failures.push("fixture-shell-ready never appeared in the native terminal");
+
+  // 4. The user can type into it (the real PTY-over-SSH session).
+  const screen = page.locator("[data-sidebar-terminal] .xterm-screen").first();
+  try {
+    await screen.click({ force: true });
+  } catch {
+    failures.push("could not focus the native terminal screen");
+  }
+  await page.keyboard.type("printf 'terminal-ok\\n'", { delay: 20 });
+  await page.keyboard.press("Enter");
+  const typed = await waitForCondition(
+    async () => (await terminal.innerText()).includes("terminal-ok"),
+    20_000,
+  );
+  if (!typed) failures.push("typing into the native terminal did not run the command");
+  // 5. The terminal.open result was handed to the conversation as a user message.
+  const handedOff = await waitForCondition(
+    async () => (await bodyText()).includes("已连接远程主机 termbox"),
+    20_000,
+  );
+  if (!handedOff) failures.push("quick connect did not inject the 已连接远程主机 termbox user message");
+  await mkdir(dirname(TERMINAL_SHOT), { recursive: true });
+  await page.screenshot({ path: TERMINAL_SHOT });
+  console.log(`remote-terminal: wrote ${TERMINAL_SHOT}`);
+
+  // Quick connect navigated the main column to the conversation; return to the
+  // Remote Ops page for the audit/host-manager checks.
+  const opsEntry = page.getByText("远程运维", { exact: false }).first();
+  try {
+    await opsEntry.waitFor({ state: "visible", timeout: 10_000 });
+    await opsEntry.click({ force: true });
+    await page.waitForTimeout(1200);
+  } catch {
+    failures.push("could not return to the Remote Ops page after quick connect");
+  }
+
+  // 6. Per-host audit modal.
+  const auditButton = page.locator('[data-host-action="audit"][data-host-name="termbox"]').first();
+  if ((await auditButton.count()) === 0) {
+    failures.push('the host actions column has no 审计 button for host "termbox"');
+  } else {
+    await auditButton.click({ force: true });
+    const audit = page.locator("[data-dsh-remote-audit]").first();
+    try {
+      await audit.waitFor({ state: "visible", timeout: 8_000 });
+    } catch {
+      failures.push("the per-host audit modal did not open");
+    }
+    const rows = await page.locator("[data-dsh-remote-audit] [data-audit-entry]").count();
+    const auditText = await audit.innerText().catch(() => "");
+    if (rows < 1) failures.push("the per-host audit modal has no entries (expected the terminal session event)");
+    if (!/termbox|terminal|连接|打开|open/i.test(auditText)) {
+      failures.push("the audit modal does not show the termbox terminal session event");
+    }
+    const refresh = page.locator('[data-dsh-remote-audit] [data-audit-action="refresh"]').first();
+    if ((await refresh.count()) > 0) await refresh.click({ force: true });
+    const closeAudit = page.locator('[data-dsh-remote-audit] [data-audit-action="close"]').first();
+    if ((await closeAudit.count()) > 0) await closeAudit.click({ force: true });
+    else await page.keyboard.press("Escape");
+    await page.waitForTimeout(500);
+  }
+
+  // 7. Host manager form round-trip (add -> delete).
+  const create = page.locator('[data-host-action="create"]').first();
+  if ((await create.count()) === 0) {
+    failures.push("the host management 添加主机 entry is missing");
+  } else {
+    await create.click({ force: true });
+    const form = page.locator("[data-dsh-remote-host-form]").first();
+    try {
+      await form.waitFor({ state: "visible", timeout: 8_000 });
+    } catch {
+      failures.push("the add-host form did not open");
+    }
+    const field = (name) => page.locator(`[data-host-field="${name}"]`).first();
+    await field("name").fill("uihost");
+    await field("host").fill("127.0.0.1");
+    if ((await field("port").count()) > 0) await field("port").fill("2222");
+    if ((await field("username").count()) > 0) await field("username").fill("demo");
+    const save = page.locator('[data-host-form-action="save"]').first();
+    await save.click({ force: true });
+    const added = await waitForCondition(
+      async () => (await page.locator('[data-host-action="audit"][data-host-name="uihost"]').count()) > 0,
+      10_000,
+    );
+    if (!added) {
+      failures.push("saving the host form did not add host uihost to the table");
+    } else {
+      const del = page.locator('[data-host-action="delete"][data-host-name="uihost"]').first();
+      if ((await del.count()) === 0) {
+        failures.push("the managed host uihost has no 删除 action");
+      } else {
+        await del.click({ force: true });
+        const confirm = page.locator('[data-dsh-remote-confirm] [data-confirm-action="ok"]').first();
+        if ((await confirm.count()) > 0) await confirm.click({ force: true });
+        else await page.keyboard.press("Enter");
+        const removed = await waitForCondition(
+          async () => (await page.locator('[data-host-action="audit"][data-host-name="uihost"]').count()) === 0,
+          10_000,
+        );
+        if (!removed) failures.push("deleting managed host uihost did not remove it from the table");
+      }
+    }
+  }
+
+  // 8. Per-conversation SSH session reuse: opening the same host again must
+  //    return the same relay sessionKey (one SSH PTY per conversation + host).
+  const sessionId = await page.evaluate(function readOnScreenSession() {
+    const owner = document.querySelector("[data-sidebar-right-session]");
+    return owner === null ? null : owner.getAttribute("data-sidebar-right-session");
+  });
+  const openedAgain = await callApiFromPage(page, { method: "terminal.open", name: "termbox", sessionId });
+  const listed = await callApiFromPage(page, { method: "terminal.list", sessionId });
+  const againKey = openedAgain.payload?.result?.shell?.sessionKey ?? null;
+  const listKeys = (listed.payload?.result?.sessions ?? []).map((session) => session.sessionKey);
+  if (openedAgain.status !== 200 || openedAgain.payload?.ok !== true) {
+    failures.push(`second terminal.open failed: ${JSON.stringify(openedAgain.payload)}`);
+  } else if (listKeys.length !== 1 || listKeys[0] !== againKey || (sessionId !== null && listed.payload?.result?.sessions?.[0]?.sessionId !== sessionId)) {
+    failures.push(`terminal session was not reused: open=${againKey} list=${JSON.stringify(listed.payload?.result?.sessions ?? [])}`);
+  } else {
+    console.log(`remote-terminal: reused session ${againKey} (conversation ${sessionId ?? "(none)"})`);
+  }
+
+  // Leave the page tidy for the docs screenshot: dismiss transient notices.
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const close = page.locator("[data-dsh-remote-notice] .dshr-notice-close").first();
+    if ((await close.count()) === 0) break;
+    await close.click({ force: true }).catch(() => {});
+    await page.waitForTimeout(200);
+  }
+
+  return failures;
+}
+
+// The interactive-terminal verification needs a real SSH server for the relay.
+const terminalFixture = remoteTerminal || docsShots ? await startSshServer() : null;
+
 // Create the isolated web profile on first use (bundle row + credentials link),
 // then keep its plugin copy in sync with the working tree.
 const profileDir = join(DSH_HOME, "profiles", PROFILE);
@@ -461,9 +749,42 @@ if (process.env.DEV_WEB_SKIP_SYNC !== "1") {
   console.log("DEV_WEB_SKIP_SYNC=1: using the profile's installed plugin copy");
 }
 
+if (terminalFixture !== null) {
+  // A deterministic, fixture-backed host for the interactive-terminal checks.
+  // The profile patch replaces the dsh-remote row's config, so keep the dev
+  // live-mirror flags the v0.4 checks need.
+  await mkdir(join(DSH_HOME, "remote"), { recursive: true });
+  await rm(join(DSH_HOME, "remote", "hosts.json"), { force: true });
+  const patchPath = join(profileDir, "cordis.patch.yml");
+  await writeFile(
+    patchPath,
+    [
+      "- id: dsh-remote",
+      "  name: dsh-remote",
+      "  config:",
+      "    devLiveEvents: true",
+      "    liveTerminal: true",
+      "    autoOpenLiveTerminal: true",
+      "    userTerminal: true",
+      "    hosts:",
+      "      - name: termbox",
+      '        host: "127.0.0.1"',
+      `        port: ${terminalFixture.port}`,
+      '        username: "testuser"',
+      "        passwordEnv: TERMBOX_PASSWORD",
+      "        tags: [fixture]",
+      '        description: interactive terminal fixture',
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  console.log(`remote-terminal: fixture ssh ${terminalFixture.host}:${terminalFixture.port}`);
+}
+
 const childEnv = { ...process.env, DSH_HOME };
 delete childEnv.DSH_PROFILE;
 delete childEnv.DSH_PROFILE_DIR;
+if (terminalFixture !== null) childEnv.TERMBOX_PASSWORD = terminalFixture.password;
 
 const server = spawn("dsh", ["--profile", PROFILE, "--no-open", "--port", String(port)], {
   cwd: REPO,
@@ -527,6 +848,9 @@ try {
     }
   });
   page.on("pageerror", (error) => diagnostics.push(`[pageerror] ${error.stack ?? error.message}`));
+  page.on("dialog", (dialog) => {
+    dialog.accept().catch(() => {});
+  });
   page.on("response", (response) => {
     if (response.status() >= 400) diagnostics.push(`[http ${response.status()}] ${response.url()}`);
   });
@@ -537,19 +861,7 @@ try {
       // First-run overlays (preview notes, guide masks) can cover the sidebar.
       // Dismiss any visible one before the first click.
       if (index === 0) {
-        for (const dismissLabel of ["继续", "知道了", "开始使用", "跳过", "关闭"]) {
-          const button = page.getByRole("button", { name: dismissLabel, exact: false }).first();
-          try {
-            if ((await button.count()) > 0 && (await button.isVisible())) {
-              await button.click();
-              await page.waitForTimeout(500);
-            }
-          } catch {
-            /* not an overlay */
-          }
-        }
-        await page.keyboard.press("Escape").catch(() => {});
-        await page.waitForTimeout(300);
+        await dismissOverlays(page);
       }
       // Prefer a real button (e.g. "测试连接" also appears inside a hint text).
       let target = page.getByRole("button", { name: label, exact: false }).first();
@@ -563,10 +875,14 @@ try {
     if (emitLive) {
       failures.push(...(await verifyLiveTerminal(page)));
     }
+    if (remoteTerminal) {
+      failures.push(...(await verifyRemoteTerminal(page)));
+    }
     if (clicks.length === 0 && !emitLive) await page.waitForTimeout(waitMs);
     await mkdir(dirname(out), { recursive: true });
     await page.screenshot({ path: out, fullPage: false });
     console.log(`screenshot: ${out}`);
+    if (docsShots) await captureDocsTerminalShot(page, url);
     const body = await page.locator("body").innerText();
     console.log("--- body text (first 5000 chars) ---");
     console.log(body.slice(0, 5000));
@@ -592,6 +908,9 @@ try {
   exitCode = 1;
   console.error(error instanceof Error ? error.message : String(error));
 } finally {
+  if (terminalFixture !== null) {
+    await terminalFixture.close().catch(() => {});
+  }
   if (!keep) {
     server.kill("SIGTERM");
     await new Promise((resolve) => {

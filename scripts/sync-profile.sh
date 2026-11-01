@@ -31,6 +31,14 @@ rsync -a --delete \
   "$REPO_DIR/lib/" "$TARGET/lib/"
 rsync -a "$REPO_DIR/package.json" "$REPO_DIR/cordis.patch.yml" "$TARGET/"
 
+# The native-terminal launcher lives in the top-level bin/ directory (packaged
+# via package.json "files"); keep the dev profile identical to a tarball
+# install. Conditional so the script still works on a checkout without it.
+if [ -d "$REPO_DIR/bin" ]; then
+  mkdir -p "$TARGET/bin"
+  rsync -a --delete "$REPO_DIR/bin/" "$TARGET/bin/"
+fi
+
 # Runtime dependencies (ssh2 and its transitive packages); devDependencies are
 # deliberately excluded so the copy matches a production install.
 if [ -d "$REPO_DIR/node_modules/ssh2" ]; then
