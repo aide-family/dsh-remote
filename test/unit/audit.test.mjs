@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { describe, it } from "node:test";
 
-import { boundDetail, createAuditLog } from "../../lib/audit.js";
+import { DETAIL_FULL_MAX, boundDetail, boundDetailFull, createAuditLog } from "../../lib/audit.js";
 
 test("records newest first and bounds the ring", () => {
   const audit = createAuditLog({ limit: 3 });
@@ -194,4 +194,62 @@ describe("audit host filter, offset and count", () => {
     assert.equal(audit.count(), 0);
     assert.equal(audit.count({ host: "a" }), 0);
   });
+});
+
+test("detailFull keeps the raw subject (whitespace intact) while detail stays one-line", () => {
+  const audit = createAuditLog({ limit: 5 });
+  const raw = `line one\n\tline two\r\n${"x".repeat(20_000)}`;
+  const entry = audit.record({ tool: "remote_exec", host: "box", action: "exec", detail: raw });
+  assert.equal(entry.detail.length, 300);
+  assert.equal(entry.detail.includes("\n"), false);
+  assert.equal(entry.detailFull.startsWith("line one\n\tline two\r\n"), true);
+  assert.ok(entry.detailFull.length <= DETAIL_FULL_MAX);
+  assert.ok(entry.detailFull.endsWith("…"));
+  assert.equal(entry.detailFull.length, DETAIL_FULL_MAX);
+  assert.equal(boundDetailFull("  a\n b  "), "  a\n b  ");
+  assert.equal(boundDetailFull(null), "");
+  assert.equal(boundDetailFull(42), "42");
+});
+
+test("list() omits detailFull unless full: true and tolerates legacy entries", async () => {
+  const audit = createAuditLog({ limit: 10 });
+  audit.record({ tool: "remote_exec", host: "me", action: "exec", detail: "echo hi\nsecond line" });
+  const plain = audit.list();
+  assert.equal(Object.prototype.hasOwnProperty.call(plain[0], "detailFull"), false);
+  assert.deepEqual(audit.list({ limit: 1, full: false })[0].detail, "echo hi second line");
+  const full = audit.list({ full: true });
+  assert.equal(full[0].detailFull, "echo hi\nsecond line");
+  assert.equal(full[0].detail, "echo hi second line");
+
+  const dir = await mkdtemp(join(tmpdir(), "dsh-remote-audit-full-"));
+  const filePath = join(dir, "audit.jsonl");
+  try {
+    const legacy = {
+      id: 1,
+      time: Date.now() - 1_000,
+      tool: "remote_exec",
+      host: "me",
+      action: "exec",
+      risk: "low",
+      outcome: "ok",
+      detail: "legacy one-line",
+      durationMs: 1,
+    };
+    const written = createAuditLog({ limit: 10, filePath });
+    written.record({ tool: "remote_shell_send", host: "me", action: "shell send", detail: "printf 'a\\nb'\n" });
+    await written.flush();
+    await writeFile(filePath, `${JSON.stringify(legacy)}\n${await readFile(filePath, "utf8")}`, "utf8");
+
+    const restored = createAuditLog({ limit: 10, filePath });
+    await restored.load();
+    const entries = restored.list({ full: true });
+    assert.equal(entries.length, 2);
+    assert.equal(entries[1].detail, "legacy one-line");
+    assert.equal(entries[1].detailFull, "legacy one-line", "a legacy line is backfilled from detail");
+    assert.equal(entries[0].detailFull, "printf 'a\\nb'\n");
+    // The default page never ships the raw field, even for restored entries.
+    assert.equal(Object.prototype.hasOwnProperty.call(restored.list()[1], "detailFull"), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

@@ -7,7 +7,10 @@
  * registry and terminal relay, plus the real audit ring.
  */
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { API_PREFIX, createManagementApi } from "../../lib/api.js";
@@ -166,6 +169,10 @@ function createRelay() {
       updatedAt: 1_730_000_001_000,
       lastError: null,
       bytesOut: 128,
+      bytesIn: 64,
+      attachCount: 3,
+      lastAttachAt: 1_730_000_002_000,
+      lastDetachAt: 1_730_000_003_000,
     },
   ];
   return {
@@ -186,7 +193,7 @@ function createRelay() {
       }
       return {
         shell: {
-          command: `exec '/repo/bin/dsh-remote-terminal' --host '${hostName}' --session 'conv-1' --socket '/tmp/dsh-remote-test/terminal.sock'`,
+          command: `exec '/usr/local/bin/node' '/repo/lib/terminal/bridge.cjs' --host '${hostName}' --session 'conv-1' --socket '/tmp/dsh-remote-test/terminal.sock'`,
           sessionKey: "conv-1::testbox",
           socketPath: "/tmp/dsh-remote-test/terminal.sock",
           host: { name: hostName, target: "ops@10.0.0.5:22" },
@@ -207,7 +214,7 @@ function createRelay() {
   };
 }
 
-function createFakes({ allowHosts = [], registry, relay } = {}) {
+function createFakes({ allowHosts = [], registry, relay, debugLogPath } = {}) {
   const transportCalls = [];
   const managerCalls = [];
   const storeCalls = { invalidate: 0, list: 0 };
@@ -291,7 +298,7 @@ function createFakes({ allowHosts = [], registry, relay } = {}) {
     },
   };
   const config = normalizeConfig({ includeSshConfig: false, allowHosts });
-  const audit = createAuditLog({ limit: 20 });
+  const audit = createAuditLog({ limit: 500 });
   audit.record({ tool: "remote_exec", host: "testbox", action: "exec", risk: "low", outcome: "ok", detail: "uptime", durationMs: 5 });
   const ctx = {
     get(name) {
@@ -313,6 +320,7 @@ function createFakes({ allowHosts = [], registry, relay } = {}) {
     audit,
     registry,
     relay,
+    debugLogPath,
     transportCalls,
     managerCalls,
     storeCalls,
@@ -332,6 +340,7 @@ async function startApi(fakes, { fence = true } = {}) {
     registry: fakes.registry,
     relay: fakes.relay,
     hostStore: fakes.hosts,
+    debugLogPath: fakes.debugLogPath,
   });
   const server = createServer(handler);
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -369,7 +378,7 @@ test("overview returns hosts, sessions, policy and the audit trail", async () =>
     assert.equal(status, 200);
     assert.equal(payload.ok, true);
     const result = payload.result;
-    assert.equal(result.version, "0.5.0");
+    assert.equal(result.version, "0.5.1");
     assert.equal(result.policy, "auto");
     assert.equal(result.hosts.length, 1);
     assert.equal(result.hosts[0].name, "testbox");
@@ -563,6 +572,122 @@ test("host methods map registry errors onto documented codes/statuses", async ()
   }
 });
 
+test("overview.audit carries exactly the newest 20 operations", async () => {
+  const fakes = createFakes();
+  for (let i = 1; i <= 25; i += 1) {
+    fakes.audit.record({ tool: "remote_exec", host: "testbox", action: "exec", risk: "low", outcome: "ok", detail: `cmd-${i}` });
+  }
+  const api = await startApi(fakes);
+  try {
+    const { payload } = await call(api, "overview");
+    assert.equal(payload.result.audit.length, 20, "v0.5.1 caps the overview at 20 entries");
+    assert.equal(payload.result.audit[0].detail, "cmd-25");
+    assert.equal(payload.result.audit.at(-1).detail, "cmd-6");
+    assert.equal(Object.prototype.hasOwnProperty.call(payload.result.audit[0], "detailFull"), false);
+    assert.equal(payload.result.counts.audit, 26);
+    // The audit modal/export still pages the whole ring through audit.list.
+    const all = await call(api, "audit.list", { limit: 1_000 });
+    assert.equal(all.payload.result.total, 26);
+    assert.equal(all.payload.result.entries.length, 26);
+  } finally {
+    await api.close();
+  }
+});
+
+test("audit.list full exposes the raw detail and validates the flag", async () => {
+  const fakes = createFakes();
+  const command = `echo first\n\tsudo -v\n${"x".repeat(400)}`;
+  fakes.audit.record({ tool: "remote_exec", host: "testbox", action: "exec", risk: "high", outcome: "ok", detail: command });
+  const api = await startApi(fakes);
+  try {
+    const lightweight = await call(api, "audit.list", { host: "testbox" });
+    const pageEntry = lightweight.payload.result.entries[0];
+    assert.equal(pageEntry.detail.length, 300);
+    assert.equal(pageEntry.detail.includes("\n"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(pageEntry, "detailFull"), false);
+
+    const withFull = await call(api, "audit.list", { host: "testbox", full: true });
+    assert.equal(withFull.payload.result.entries[0].detailFull, command);
+
+    const invalid = await call(api, "audit.list", { full: "yes" });
+    assert.equal(invalid.status, 400);
+    assert.equal(invalid.payload.error.code, "AUDIT_INVALID");
+  } finally {
+    await api.close();
+  }
+});
+
+test("terminal.trace appends bounded client diagnostics and skips the audit ring", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dsh-remote-trace-"));
+  const debugLogPath = join(dir, "nested", "terminal-debug.log");
+  const fakes = createFakes({ debugLogPath });
+  const api = await startApi(fakes);
+  try {
+    const auditSizeBefore = fakes.audit.size;
+    const traced = await call(api, "terminal.trace", {
+      stage: "attached",
+      sessionId: "conv-1",
+      detail: "attached after 1 retry",
+    });
+    assert.equal(traced.status, 200);
+    assert.deepEqual(traced.payload.result, { ok: true });
+    assert.equal(fakes.audit.size, auditSizeBefore, "trace lines are not recorded in the audit ring");
+
+    const lines = (await readFile(debugLogPath, "utf8")).trim().split("\n");
+    assert.equal(lines.length, 1);
+    const parsed = JSON.parse(lines[0]);
+    assert.equal(parsed.stage, "attached");
+    assert.equal(parsed.sessionId, "conv-1");
+    assert.equal(parsed.detail, "attached after 1 retry");
+    assert.equal(typeof parsed.time, "number");
+
+    await call(api, "terminal.trace", { stage: "api" });
+    const optional = JSON.parse((await readFile(debugLogPath, "utf8")).trim().split("\n").at(-1));
+    assert.equal(optional.sessionId, null);
+    assert.equal(optional.detail, "");
+
+    for (const bad of [
+      { stage: "not a stage!" },
+      { stage: "" },
+      { stage: "x".repeat(65) },
+      { stage: "write", detail: "x".repeat(2_001) },
+    ]) {
+      const response = await call(api, "terminal.trace", bad);
+      assert.equal(response.status, 400);
+      assert.equal(response.payload.error.code, "INVALID_ARGUMENT");
+    }
+
+    // Bounded log: appending past 256 KiB trims back to the last 64 KiB.
+    const bigDetail = "y".repeat(2_000);
+    for (let i = 0; i < 140; i += 1) {
+      await call(api, "terminal.trace", { stage: "write", detail: bigDetail });
+    }
+    const stats = await stat(debugLogPath);
+    assert.ok(stats.size > 0);
+    assert.ok(stats.size <= 256 * 1024, `trace log stays bounded (${stats.size} bytes)`);
+    const tail = JSON.parse((await readFile(debugLogPath, "utf8")).trim().split("\n").at(-1));
+    assert.equal(tail.stage, "write");
+    assert.equal(tail.detail.length, 2_000);
+  } finally {
+    await api.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("terminal.trace is best-effort when the trace path cannot be written", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dsh-remote-trace-dir-"));
+  const fakes = createFakes({ debugLogPath: dir });
+  const api = await startApi(fakes);
+  try {
+    const response = await call(api, "terminal.trace", { stage: "error", detail: "boom" });
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.payload.result, { ok: true });
+  } finally {
+    await api.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("audit.list filters by host, paginates and validates its input", async () => {
   const fakes = createFakes();
   fakes.audit.record({ tool: "remote_exec", host: "prod-web-1", action: "exec", risk: "low", outcome: "ok", detail: "uptime", durationMs: 7 });
@@ -616,8 +741,9 @@ test("terminal.open / terminal.list / terminal.close drive the relay", async () 
     const opened = await call(api, "terminal.open", { name: "testbox", sessionId: "conv-1" });
     assert.equal(opened.status, 200);
     assert.equal(typeof opened.payload.result.shell.command, "string");
-    assert.match(opened.payload.result.shell.command, /dsh-remote-terminal/);
-    assert.match(opened.payload.result.shell.command, /--host 'testbox'/);
+    assert.match(opened.payload.result.shell.command, /^exec '.*node' '.*lib\/terminal\/bridge\.cjs'/);
+    assert.match(opened.payload.result.shell.command, /--host 'testbox' --session 'conv-1'/);
+    assert.match(opened.payload.result.shell.command, /--socket '\/tmp\/dsh-remote-test\/terminal\.sock'$/);
     assert.equal(opened.payload.result.shell.sessionKey, "conv-1::testbox");
     assert.equal(opened.payload.result.session.sessionKey, "conv-1::testbox");
     assert.equal(opened.payload.result.session.state, "connected");
@@ -629,6 +755,18 @@ test("terminal.open / terminal.list / terminal.close drive the relay", async () 
     const listed = await call(api, "terminal.list", {});
     assert.equal(listed.status, 200);
     assert.equal(listed.payload.result.sessions.length, 1);
+    // v0.5.1 counters the client polls for attach/reuse evidence.
+    const listedSession = listed.payload.result.sessions[0];
+    assert.equal(listedSession.host, "testbox");
+    assert.equal(listedSession.attached, 1);
+    assert.equal(listedSession.attachCount, 3);
+    assert.equal(listedSession.bytesIn, 64);
+    assert.equal(listedSession.bytesOut, 128);
+    assert.equal(listedSession.lastAttachAt, 1_730_000_002_000);
+    assert.equal(listedSession.lastDetachAt, 1_730_000_003_000);
+    // `{sessionId: null}` / `{}` both mean "no filter" (browser harness shape).
+    const noFilter = await call(api, "terminal.list", { sessionId: null });
+    assert.equal(noFilter.payload.result.sessions.length, 1);
     const listedForSession = await call(api, "terminal.list", { sessionId: "other-conversation" });
     assert.deepEqual(listedForSession.payload.result.sessions, []);
 

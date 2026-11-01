@@ -90,7 +90,7 @@ Or do the steps manually and choose another profile:
 
 ```sh
 npm run pack:plugin
-dsh plugin --profile desktop add file:$PWD/dist/dsh-remote-0.5.0.tgz --ignore-scripts
+dsh plugin --profile desktop add file:$PWD/dist/dsh-remote-0.5.1.tgz --ignore-scripts
 ```
 
 Then fully quit and reopen the DSH Desktop app (a newly installed bundle is
@@ -294,11 +294,24 @@ How it works:
    prints a banner in the terminal; the bridge itself also retries when the DSH
    Host restarts. Nothing to re-type.
 
+**The terminal must actually be connected.** Opening a tab is not proof: the
+panel verifies that the local bridge reached the relay (`attached >= 1`,
+`bytesIn > 0`), retries the typed launch command while the shell is still
+starting, and if it still fails shows the exact command with a **复制命令**
+button plus the path of `$DSH_HOME/remote/terminal-bridge.log`. The shell line
+does not depend on the terminal's `PATH`: it uses the Host's own node binary
+(directly, through `ELECTRON_RUN_AS_NODE` in the Desktop app, or the bundled
+runtime node) and falls back to the packaged launcher. The panel also shows the
+live session state — `接入 N` (attached terminals), the short session key, and a
+`复用` badge when the same SSH session was reattached — so connection reuse is
+visible instead of assumed. The relay records `terminal attach/detach` audit
+events, so a session that opened but never attached is visible in the host's
+audit history.
+
 Limits: the relay keeps a bounded replay buffer (`userTerminalScrollbackBytes`,
 default 400 KB) so a reattached terminal shows recent output; a full-screen TUI
 is supported (it is a real PTY), but the agent still cannot use one through
-`remote_shell_*`. The bridge needs `node` on the terminal's `PATH` (override with
-`DSH_REMOTE_NODE`). Terminal sessions are process-local: a harness restart ends
+`remote_shell_*`. Terminal sessions are process-local: a harness restart ends
 them, and the terminal reconnects into a fresh shell on demand.
 
 The old host-picker shell (`scripts/dsh-remote-shell`, an `ssh -t` session
@@ -351,7 +364,7 @@ The plugin registers a first-level sidebar panel in the DSH Web/Desktop GUI:
 | Remote hosts | Every discovered host (source, `user@host:port`, auth hint, readonly / allowHosts policy) with a per-row **测试连接 / Test connection** that runs one read-only probe (connect + `uname -srm; hostname`) and shows latency and output inline. |
 | Host actions | Each row has an 操作 column: **连接** (quick connect: create the SSH session, open the native terminal, hand the host to the agent in the current conversation), **审计** (that host's command/terminal-session history), **编辑** / **删除** for managed hosts. **添加主机** opens the connection form. |
 | Remote shell sessions | Live `remote_shell_*` sessions for every agent (session id, host, status) with a bounded scrollback preview and a **结束会话 / Close** action. |
-| Recent operations | The audit trail of model-facing remote calls: time, tool, host, action, risk level (low/gray/high/write), outcome (ok / denied / error), duration, and the command/path. |
+| Recent operations | The newest **20** audit entries: time, tool, host, action, risk level (low/gray/high/write), outcome (ok / denied / error), duration, and the command/path, with a JSON/CSV/TXT export of the full retained trail. |
 
 ### Host manager
 
@@ -368,8 +381,11 @@ are listed read-only here (edit/delete only for managed entries).
 
 **审计** on a host row opens that host's operation history from the same audit
 trail: every model-facing remote call (tool, action, risk, outcome, duration,
-command/path) plus interactive-terminal lifecycle events (open / reconnect /
-close). User keystrokes typed in the interactive terminal are never recorded
+command/path) plus interactive-terminal lifecycle events (open / attach /
+reconnect / close). Each row expands to the **complete** command (the raw text,
+whitespace preserved — the table keeps a short one-line summary), and
+JSON / CSV / TXT export covers either the current host or the whole retained
+trail. User keystrokes typed in the interactive terminal are never recorded
 (they can contain passwords typed at a sudo prompt).
 
 The page polls the Host every 10 seconds and has manual refresh and audit-clear
@@ -504,7 +520,7 @@ Crescent project (`aide-family/Crescent`, `src/shared/command-guard.ts`,
 ## Verification
 
 ```sh
-npm test        # 642 tests: unit + real-fixture integration (no external servers)
+npm test        # 669 tests: unit + real-fixture integration (no external servers)
 npm run e2e     # real DSH headless run against a fixture SSH server
 node scripts/dev-web-test.mjs --remote-terminal --docs-shots   # real browser loop (v0.5)
 ```
@@ -524,7 +540,11 @@ handoff, the per-host audit modal, the host-manager add/delete round-trip, and
 per-conversation session reuse (same sessionKey on a second open) — with zero
 browser console errors. `--docs-shots` additionally captures
 `docs/assets/remote-terminal.png` from a clean panel-driven terminal (no agent
-handoff). Run the browser loop with full process access: the DSH Host must be able
+handoff). The v0.5.1 pass additionally asserts the relay `attached`/`attachCount`
+/`bytesIn` counters (the local bridge really reached the SSH session), the
+per-host audit `attach` event, one-click full-detail expansion, a real JSON
+export download with `detailFull`, and that `overview.audit` returns at most the
+newest 20 entries. Run the browser loop with full process access: the DSH Host must be able
 to allocate a POSIX PTY for the native terminal, which an agent workspace sandbox
 can deny (`posix_openpt: Operation not permitted`). A packaged tarball
 install is verified separately:

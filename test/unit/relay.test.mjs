@@ -143,6 +143,18 @@ function makeHosts({ hosts = [makeHost('alpha')], allowed = true } = {}) {
   }
 }
 
+/**
+ * Offline, deterministic node-launcher options: a plain (non-Electron) node
+ * path, so the shell line is stable and no probe ever spawns.
+ */
+const TEST_LAUNCHER = Object.freeze({
+  env: {},
+  execPath: '/usr/local/bin/node',
+  versions: {},
+  platform: 'linux',
+  existsSync: () => true,
+})
+
 /** @param {Record<string, any>} [overrides] */
 function makeConfig(overrides = {}) {
   return {
@@ -157,7 +169,7 @@ function makeConfig(overrides = {}) {
  * Create a relay on a throwaway socket path plus its fakes. Registers teardown.
  *
  * @param {import('node:test').TestContext} t
- * @param {{ config?: Record<string, any>, transport?: any, hosts?: any[], allowed?: boolean, audit?: any, socketPath?: string }} [options]
+ * @param {{ config?: Record<string, any>, transport?: any, hosts?: any[], allowed?: boolean, audit?: any, socketPath?: string, launcher?: Record<string, any> }} [options]
  */
 async function makeRelay(t, options = {}) {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-relay-'))
@@ -175,6 +187,7 @@ async function makeRelay(t, options = {}) {
     audit,
     logger: QUIET_LOGGER,
     socketPath: options.socketPath ?? path.join(dir, 'terminal.sock'),
+    launcher: options.launcher ?? TEST_LAUNCHER,
   })
   t.after(async () => {
     await relay.dispose()
@@ -245,6 +258,7 @@ test('relay: socket path defaults, overrides and session keys', async (t) => {
     config: makeConfig(),
     logger: QUIET_LOGGER,
     socketPath,
+    launcher: TEST_LAUNCHER,
   })
   t.after(() => relay.dispose())
   assert.equal(relay.socketPath, socketPath)
@@ -277,6 +291,7 @@ test('relay: a live socket is reused, never unlinked, and refuses foreign sessio
     config: makeConfig(),
     logger: QUIET_LOGGER,
     socketPath,
+    launcher: TEST_LAUNCHER,
   })
   t.after(() => owner.dispose())
   await owner.start()
@@ -290,6 +305,7 @@ test('relay: a live socket is reused, never unlinked, and refuses foreign sessio
     config: makeConfig(),
     logger: QUIET_LOGGER,
     socketPath,
+    launcher: TEST_LAUNCHER,
   })
   t.after(() => second.dispose())
   await second.start()
@@ -309,12 +325,12 @@ test('relay: open builds the shell command and a JSON-safe session view', async 
   assert.equal(opened.shell.sessionKey, 'conv-1::alpha')
   assert.equal(opened.shell.socketPath, relay.socketPath)
   assert.deepEqual(opened.shell.host, { name: 'alpha', target: 'ops@127.0.0.1:2222' })
-  assert.match(opened.shell.command, /^exec '/u)
+  // v0.5.1: a direct node binary + the bridge path, never a PATH-dependent
+  // launcher when the Host already knows its node.
   assert.match(
     opened.shell.command,
-    /--host 'alpha' --session 'conv-1' --socket '.*terminal\.sock'$/u,
+    /^exec '\/usr\/local\/bin\/node' '.*lib\/terminal\/bridge\.cjs' --host 'alpha' --session 'conv-1' --socket '.*terminal\.sock'$/u,
   )
-  assert.match(opened.shell.command, /bin\/dsh-remote-terminal' /u)
   assert.deepEqual(opened.session, {
     sessionKey: 'conv-1::alpha',
     host: 'alpha',
@@ -329,6 +345,10 @@ test('relay: open builds the shell command and a JSON-safe session view', async 
     updatedAt: opened.session.updatedAt,
     lastError: null,
     bytesOut: 0,
+    bytesIn: 0,
+    attachCount: 0,
+    lastAttachAt: null,
+    lastDetachAt: null,
   })
   assert.equal(typeof opened.session.createdAt, 'number')
   assert.equal(transport.opens.length, 1)
@@ -404,6 +424,7 @@ test('relay: failed PTY opens reject cleanly with no unhandled rejection', async
     config: makeConfig(),
     logger: QUIET_LOGGER,
     socketPath: path.join(dir, 'terminal.sock'),
+    launcher: TEST_LAUNCHER,
   })
   t.after(async () => {
     await relay.dispose()
@@ -462,6 +483,102 @@ test('relay: attach replays a bounded tail with a clear screen and broadcasts ou
   await waitFor(() => relay.list()[0].attached === 0, { label: 'all bridges detached' })
 })
 
+test('relay: bridge attach/detach audit events and the v0.5.1 session counters', async (t) => {
+  const { relay, audit } = await makeRelay(t)
+  await relay.start()
+  await relay.open({ hostName: 'alpha', sessionId: 'conv-1' })
+  assert.equal(relay.list()[0].bytesIn, 0)
+  assert.equal(relay.list()[0].attachCount, 0)
+  assert.equal(relay.list()[0].lastAttachAt, null)
+  assert.equal(relay.list()[0].lastDetachAt, null)
+
+  const bridge = await attachBridge(relay.socketPath, { host: 'alpha', sessionId: 'conv-1' })
+  await waitFor(() => relay.list()[0].attached === 1 && relay.list()[0].attachCount === 1, {
+    label: 'first bridge attached',
+  })
+  assert.equal(typeof relay.list()[0].lastAttachAt, 'number')
+  assert.equal(relay.list()[0].lastDetachAt, null)
+
+  const second = await attachBridge(relay.socketPath, { host: 'alpha', sessionId: 'conv-1' })
+  await waitFor(() => relay.list()[0].attached === 2 && relay.list()[0].attachCount === 2, {
+    label: 'second bridge attached',
+  })
+
+  // bytesIn counts decoded input frames only (never the replay/output).
+  bridge.socket.write(`${JSON.stringify({ t: 'i', d: Buffer.from('echo hi\r').toString('base64') })}\n`)
+  await waitFor(() => relay.list()[0].bytesIn === Buffer.byteLength('echo hi\r'), { label: 'bytesIn counted' })
+  assert.equal(relay.list()[0].bytesOut, 0)
+
+  detachBridge(second)
+  await waitFor(() => relay.list()[0].attached === 1 && relay.list()[0].lastDetachAt !== null, {
+    label: 'second bridge detached',
+  })
+  detachBridge(bridge)
+  await waitFor(() => relay.list()[0].attached === 0)
+  await waitFor(() => audit.entries.filter((entry) => entry.action === 'detach').length === 2, {
+    label: 'detach audit events',
+  })
+
+  const terminalEvents = audit.entries.filter((entry) => entry.tool === 'terminal')
+  assert.deepEqual(
+    terminalEvents.map((entry) => entry.action),
+    ['open', 'attach', 'attach', 'detach', 'detach'],
+  )
+  assert.deepEqual(
+    terminalEvents.map((entry) => entry.detail),
+    [
+      'conv-1::alpha (ops@127.0.0.1:2222)',
+      'conv-1::alpha (attached 1)',
+      'conv-1::alpha (attached 2)',
+      'conv-1::alpha (attached 1)',
+      'conv-1::alpha (attached 0)',
+    ],
+  )
+  for (const entry of terminalEvents) {
+    assert.equal(entry.host, 'alpha')
+    assert.equal(entry.risk, 'read')
+    assert.equal(entry.outcome, 'ok')
+  }
+})
+
+test('relay: shell command uses the Electron run-as-node form when the probe succeeds', async (t) => {
+  const execPath = '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness'
+  const { relay } = await makeRelay(t, {
+    launcher: {
+      env: {},
+      execPath,
+      versions: { electron: '30.0.0' },
+      platform: 'darwin',
+      existsSync: () => false,
+      probeElectronRunAsNode: () => true,
+    },
+  })
+  const opened = await relay.open({ hostName: 'alpha', sessionId: 'conv-1' })
+  assert.match(
+    opened.shell.command,
+    /^exec env ELECTRON_RUN_AS_NODE=1 '\/Applications\/DeepSeek Harness\.app\/Contents\/MacOS\/DeepSeek Harness' '.*lib\/terminal\/bridge\.cjs' --host 'alpha' --session 'conv-1' --socket '.*terminal\.sock'$/u,
+  )
+})
+
+test('relay: shell command falls back to the launcher when no node can be launched', async (t) => {
+  const { relay } = await makeRelay(t, {
+    launcher: {
+      env: {},
+      execPath: '/Applications/App.app/Contents/MacOS/App',
+      versions: { electron: '30.0.0' },
+      platform: 'darwin',
+      existsSync: () => false,
+      probeElectronRunAsNode: () => false,
+    },
+  })
+  const opened = await relay.open({ hostName: 'alpha', sessionId: 'conv-1' })
+  assert.match(
+    opened.shell.command,
+    /^exec '.*bin\/dsh-remote-terminal' --host 'alpha' --session 'conv-1' --socket '.*terminal\.sock'$/u,
+  )
+  assert.doesNotMatch(opened.shell.command, /bridge\.cjs/u)
+})
+
 test('relay: routes input/resize frames and ignores malformed frames', async (t) => {
   const { relay, transport } = await makeRelay(t)
   await relay.start()
@@ -515,7 +632,7 @@ test('relay: unexpected PTY exit reconnects with backoff and keeps the bridge at
   assert.equal(relay.list()[0].attached, 1)
 
   const calls = audit.entries.map((entry) => entry.action)
-  assert.deepEqual(calls, ['open', 'reconnect'])
+  assert.deepEqual(calls, ['open', 'attach', 'reconnect'])
 
   // PTY output after the reconnect flows to the still-attached bridge.
   transport.ptys[1].emit('after-reconnect\r\n')
@@ -598,6 +715,7 @@ async function makeRelay2(t) {
     config: makeConfig({ userTerminalTtlMs: 0 }),
     logger: QUIET_LOGGER,
     socketPath: path.join(dir, 'terminal.sock'),
+    launcher: TEST_LAUNCHER,
   })
   t.after(async () => {
     await relay.dispose()
@@ -645,6 +763,25 @@ test('relay: close() closes the PTY only; dispose is quiescent and cleanup-safe'
   raw.destroy()
 })
 
+test('relay: dispose while a bridge is attached is quiescent (never deadlocks)', async (t) => {
+  const { relay, transport } = await makeRelay(t)
+  await relay.start()
+  const opened = await relay.open({ hostName: 'alpha', sessionId: 'conv-1' })
+  const bridge = await attachBridge(relay.socketPath, { host: 'alpha', sessionId: 'conv-1' })
+  await waitFor(() => relay.list()[0].attached === 1)
+
+  // `server.close()` only completes once every accepted socket is gone; dispose
+  // must end the bridges first or a teardown with a live terminal would hang.
+  const startedAt = Date.now()
+  await relay.dispose()
+  assert.equal(relay.isDisposed, true)
+  assert.ok(Date.now() - startedAt < 2_000, 'dispose must not wait for the attached bridge')
+  await waitFor(() => bridge.closed, { label: 'bridge closed by dispose' })
+  assert.equal(transport.ptys[0].closeCalls, 1)
+  assert.equal(opened.session.state, 'connected', 'the view returned before dispose is a snapshot')
+  assert.deepEqual(relay.list(), [])
+})
+
 test('relay: a throwing audit/logger never breaks a session or its handlers', async (t) => {
   const explosive = {
     record() {
@@ -674,6 +811,7 @@ test('relay: a throwing audit/logger never breaks a session or its handlers', as
     audit: explosive,
     logger: explosiveLogger,
     socketPath: path.join(dir, 'terminal.sock'),
+    launcher: TEST_LAUNCHER,
   })
   t.after(async () => {
     await relay.dispose()

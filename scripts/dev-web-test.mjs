@@ -591,6 +591,30 @@ async function verifyRemoteTerminal(page) {
     20_000,
   );
   if (!typed) failures.push("typing into the native terminal did not run the command");
+
+  // v0.5.1: prove the local bridge actually attached to the relay session
+  // (attached>=1, attachCount>=1, bytesIn>0 for the typed command) — this is the
+  // failure the real Desktop app showed while only a local shell appeared.
+  const attachedCheck = await callApiFromPage(page, { method: "terminal.list", sessionId: null });
+  const attachedSessions = attachedCheck.payload?.result?.sessions ?? [];
+  const attachedSession = attachedSessions.find(function findTermbox(session) {
+    return session && session.host === "termbox";
+  });
+  if (attachedCheck.status !== 200 || attachedCheck.payload?.ok !== true) {
+    failures.push(`terminal.list failed: HTTP ${attachedCheck.status} ${JSON.stringify(attachedCheck.payload)}`);
+  } else if (attachedSession === undefined) {
+    failures.push("terminal.list has no termbox relay session after quick connect");
+  } else if (!(attachedSession.attached >= 1)) {
+    failures.push(`relay session is not attached (attached=${attachedSession.attached})`);
+  } else if (!(attachedSession.attachCount >= 1)) {
+    failures.push(`relay session attachCount is ${attachedSession.attachCount}, expected >= 1`);
+  } else if (!(attachedSession.bytesIn > 0)) {
+    failures.push(`relay session bytesIn is ${attachedSession.bytesIn}, expected the typed command bytes`);
+  } else {
+    console.log(
+      `remote-terminal: bridge attached attachCount=${attachedSession.attachCount} bytesIn=${attachedSession.bytesIn} key=${attachedSession.sessionKey}`,
+    );
+  }
   // 5. The terminal.open result was handed to the conversation as a user message.
   const handedOff = await waitForCondition(
     async () => (await bodyText()).includes("已连接远程主机 termbox"),
@@ -630,12 +654,70 @@ async function verifyRemoteTerminal(page) {
     if (!/termbox|terminal|连接|打开|open/i.test(auditText)) {
       failures.push("the audit modal does not show the termbox terminal session event");
     }
+    if (!/attach/i.test(auditText)) {
+      failures.push("the audit modal has no terminal attach event (bridge never attached?)");
+    }
+    // Full-detail expansion: the row reveals the raw detailFull (<pre>).
+    const expand = page.locator("[data-dsh-remote-audit] [data-audit-expand]").first();
+    if ((await expand.count()) === 0) {
+      failures.push("audit rows have no 详情/expand control");
+    } else {
+      await expand.click({ force: true });
+      await page.waitForTimeout(400);
+      const full = page.locator("[data-dsh-remote-audit] [data-audit-detail-full]").first();
+      if ((await full.count()) === 0) {
+        failures.push("expanding an audit row did not show the full detail");
+      } else {
+        const fullText = await full.innerText().catch(() => "");
+        if (fullText.trim().length === 0) failures.push("the expanded audit detail is empty");
+      }
+    }
+    // Export the current host's audit (JSON): a real download must start.
+    const exportJson = page.locator('[data-dsh-remote-audit] [data-audit-action="export-json"]').first();
+    if ((await exportJson.count()) === 0) {
+      failures.push("the audit modal has no JSON export control");
+    } else {
+      const downloadPromise = page.waitForEvent("download", { timeout: 10_000 }).catch(() => null);
+      await exportJson.click({ force: true });
+      const download = await downloadPromise;
+      if (download === null) {
+        failures.push("audit JSON export did not start a download");
+      } else {
+        const name = download.suggestedFilename();
+        const path = await download.path().catch(() => null);
+        if (!/\.json$/u.test(name) || path === null) {
+          failures.push(`audit JSON export produced ${JSON.stringify(name)}`);
+        } else {
+          const exported = JSON.parse(await readFile(path, "utf8"));
+          if (!Array.isArray(exported) || exported.length < 1 || typeof exported[0].detail !== "string") {
+            failures.push("audit JSON export is not a non-empty entry array");
+          } else if (!exported.some((entry) => typeof entry.detailFull === "string" && entry.detailFull.length > 0)) {
+            failures.push("audit JSON export entries carry no detailFull");
+          } else {
+            console.log(`remote-terminal: audit export ${name} (${exported.length} entries, full detail present)`);
+          }
+        }
+      }
+    }
     const refresh = page.locator('[data-dsh-remote-audit] [data-audit-action="refresh"]').first();
     if ((await refresh.count()) > 0) await refresh.click({ force: true });
     const closeAudit = page.locator('[data-dsh-remote-audit] [data-audit-action="close"]').first();
     if ((await closeAudit.count()) > 0) await closeAudit.click({ force: true });
     else await page.keyboard.press("Escape");
     await page.waitForTimeout(500);
+  }
+
+  // v0.5.1: recent operations shows exactly the newest 20 and can export all.
+  const overviewNow = await callApiFromPage(page, { method: "overview" });
+  const overviewAudit = overviewNow.payload?.result?.audit ?? [];
+  if (overviewNow.status !== 200) {
+    failures.push(`overview failed after connect: HTTP ${overviewNow.status}`);
+  } else if (overviewAudit.length > 20) {
+    failures.push(`overview.audit returned ${overviewAudit.length} entries, expected <= 20`);
+  }
+  const recentBody = await page.locator("body").innerText().catch(() => "");
+  if (!recentBody.includes("最近 20 条操作")) {
+    failures.push('the page does not show the "最近 20 条操作" recent-operations label');
   }
 
   // 7. Host manager form round-trip (add -> delete).
