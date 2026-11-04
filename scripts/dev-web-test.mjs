@@ -463,7 +463,7 @@ async function dismissOverlays(page) {
  * Capture the documentation screenshot of the interactive terminal without the
  * quick-connect handoff (so the docs image shows the clean terminal + panel, not
  * the test profile's missing-model-key error). Reloads the page first, then
- * opens the 远程终端 panel, picks the fixture host and types `whoami; uname -sr`.
+ * opens the 远程终端 panel, picks the fixture host and prints synthetic documentation output.
  */
 async function captureDocsTerminalShot(page, url) {
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
@@ -494,7 +494,7 @@ async function captureDocsTerminalShot(page, url) {
   if (!ready) console.warn("docs-shots: fixture shell did not become ready");
   const screen = page.locator("[data-sidebar-terminal] .xterm-screen").first();
   await screen.click({ force: true });
-  await page.keyboard.type("whoami; uname -sr", { delay: 20 });
+  await page.keyboard.type("printf 'demo-user\\nDemo OS\\n'", { delay: 20 });
   await page.keyboard.press("Enter");
   await page.waitForTimeout(1500);
   await mkdir(dirname(TERMINAL_SHOT), { recursive: true });
@@ -861,12 +861,13 @@ if (process.env.DEV_WEB_SKIP_SYNC !== "1") {
   console.log("DEV_WEB_SKIP_SYNC=1: using the profile's installed plugin copy");
 }
 
-if (terminalFixture !== null) {
-  // A deterministic, fixture-backed host for the interactive-terminal checks.
-  // The profile patch replaces the dsh-remote row's config, so keep the dev
-  // live-mirror flags the v0.4 checks need.
+{
+  // Never discover the developer's real SSH inventory in browser captures.
+  // Reset the isolated registry and replace config on every run, including
+  // management-only and live-mirror checks without an SSH fixture.
   await mkdir(join(DSH_HOME, "remote"), { recursive: true });
   await rm(join(DSH_HOME, "remote", "hosts.json"), { force: true });
+  await rm(join(DSH_HOME, "remote", "audit.jsonl"), { force: true });
   const patchPath = join(profileDir, "cordis.patch.yml");
   await writeFile(
     patchPath,
@@ -874,23 +875,26 @@ if (terminalFixture !== null) {
       "- id: dsh-remote",
       "  name: dsh-remote",
       "  config:",
+      "    includeSshConfig: false",
       "    devLiveEvents: true",
       "    liveTerminal: true",
       "    autoOpenLiveTerminal: true",
       "    userTerminal: true",
-      "    hosts:",
-      "      - name: termbox",
-      '        host: "127.0.0.1"',
-      `        port: ${terminalFixture.port}`,
-      '        username: "testuser"',
-      "        passwordEnv: TERMBOX_PASSWORD",
-      "        tags: [fixture]",
-      '        description: interactive terminal fixture',
+      ...(terminalFixture === null ? ["    hosts: []"] : [
+        "    hosts:",
+        "      - name: termbox",
+        '        host: "127.0.0.1"',
+        `        port: ${terminalFixture.port}`,
+        '        username: "testuser"',
+        "        passwordEnv: TERMBOX_PASSWORD",
+        "        tags: [fixture]",
+        '        description: interactive terminal fixture',
+      ]),
       "",
     ].join("\n"),
     "utf8",
   );
-  console.log(`remote-terminal: fixture ssh ${terminalFixture.host}:${terminalFixture.port}`);
+  if (terminalFixture !== null) console.log(`remote-terminal: fixture ssh ${terminalFixture.host}:${terminalFixture.port}`);
 }
 
 const childEnv = { ...process.env, DSH_HOME };

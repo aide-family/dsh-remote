@@ -2,7 +2,7 @@
 
 `dsh-remote` is a DeepSeek Harness (DSH) plugin that lets the agent operate remote
 servers over SSH. It is modeled on the Crescent operations workbench
-(`/Users/hubiao/aide-family/Crescent`): hosts come from `~/.ssh/config` plus a
+([Crescent](https://github.com/aide-family/Crescent)): hosts come from `~/.ssh/config` plus a
 configured host list, commands run through an SSH transport, and risky commands
 go through a static command-risk review before a human approval gate.
 
@@ -17,7 +17,10 @@ Tests: `node --test` (unit) and the fixture SSH server (integration).
   Pure modules (`lib/ssh/*`, `lib/policy/**`, `lib/hosts.js`, `lib/ssh-config.js`,
   `lib/config.js`) must not import any `@deepseek-ai/*` package so unit tests run
   without DSH.
-- Never write outside `/Users/hubiao/aide-family` during development.
+- Keep development writes inside the current workspace or an explicitly configured test directory.
+- No private organization/person identifiers or real test connection details
+  in source, tests, docs or published assets. Use synthetic fixtures and reserved
+  example domains/IP ranges; do not publish local machine output or live inventory.
 - Keep each file focused; target < 700 lines; split rather than grow.
 - No secrets in output: passwords/passphrases only ever come from environment
   variables named in config; never echo their values.
@@ -274,17 +277,17 @@ over `cat`/`ls`, check exit codes, and never paste credentials.
 
 ## DSH integration facts (verified in this environment)
 
-- Plugin bundle patch (`cordis.patch.yml`): `- insert: [{ id: dsh-remote, name: dsh-remote }]`.
+- Plugin bundle patch (`cordis.patch.yml`): `- insert: [{ id: dsh-remote, name: "@aide-family/dsh-remote" }]`. The stable Cordis instance id is `dsh-remote`; the plugin module package is scoped.
 - Entry module exports `{ name, Config?, inject, apply }` (Cordis plugin).
 - `inject: ["tools", "systemPrompt"]`; approval is optional via `ctx.get("approval")`.
 - `ctx.tools.register(defineTool({...}))`, `ctx.systemPrompt.section({ name, order, text })`.
 - `ctx.effect(() => () => transport.dispose())` for teardown.
 - Local development install: the package must physically live inside
-  `<profile>/node_modules/dsh-remote` (a `link:`/symlink outside the profile
+  `<profile>/node_modules/@aide-family/dsh-remote` (a `link:`/symlink outside the profile
   cannot resolve `@deepseek-ai/*` imports). Use the tarball install
-  (`dsh plugin --profile <p> add file:/abs/path/dsh-remote-<v>.tgz`) or
+  (`dsh plugin --profile <p> add file:/abs/path/aide-family-dsh-remote-<v>.tgz`) or
   `scripts/sync-profile.sh` for the dev loop.
-- Dev/e2e harness: `DSH_HOME=/Users/hubiao/aide-family/.dsh-test`,
+- Dev/e2e harness: `DSH_HOME=$PWD/.dsh-test`,
   profile `remotedev` (headless template, credentials taken from
   `~/.dsh/.credentials.yaml` via symlink), run:
   `DSH_HOME=... dsh --profile remotedev "prompt"`.
@@ -428,10 +431,13 @@ or compatible; the full suite and the headless e2e agree with them.
 
 The desktop "Persistent terminals" bundle (which mounts `ctx.terminals`) is
 **off by default** in Web/Desktop and absent from the headless profile, so the
-remote-shell surface must not depend on it. `dsh-remote` therefore owns a small
-owner-scoped PTY session manager built on the transport's PTY channel, and
-registers six model-facing tools. If a composition later mounts `ctx.terminals`,
-a follow-up can bridge the manager to that service without changing the tools.
+remote-shell surface does not depend on it. `dsh-remote` owns both the
+owner-scoped shell manager and (when `userTerminal: true`) the native-terminal
+relay. When both native terminal and shell tools are enabled, the shell manager
+borrows the relay's canonical PTY keyed by `(conversation session id, host)`;
+Agent tools and the native terminal therefore share one SSH shell channel. If the
+native relay is disabled or unavailable, shell tools retain their standalone
+PTY behavior and do not claim to be attached to a native terminal.
 
 ### Transport contract addition — interactive PTY channel
 
@@ -483,20 +489,24 @@ channel closes.
     signal, `{ delivered: true, targetPgid: 0 }` (the remote PID is unknown over
     the SSH channel); `status()`; `close(reason)`.
 - `manager.js` — owner-scoped registry:
-  - `createShellManager({ ctx, transport, config, logger })` returns
+  - `createShellManager({ ctx, transport, config, relay?, logger })` returns
     `{ open, send, read, signal, close, list, dispose }`;
   - sessions are keyed by manager-minted id `remote-shell-<n>` and owned by the
     exact `Agent` object; operations by another agent fail with `FOREIGN_SESSION`;
+  - concurrent/repeated opens coalesce to one session per exact Agent + host. If
+    the native relay is available and `agent.id` identifies the conversation,
+    open borrows the relay PTY and reports `sharedTerminal: true`; it does not
+    resize an already-attached xterm. Otherwise it opens a standalone PTY;
   - `open` resolves the host via the host store and rejects disallowed/
     read-only-policy hosts before opening;
-  - `ctx.on("agent/disposed", …)` closes that agent's sessions; `ctx.effect`
-    disposes all sessions; disposal is quiescent (await close).
+  - `ctx.on("agent/disposed", …)` drains in-flight opens and closes that agent's
+    sessions; `ctx.effect` disposes all sessions and pending opens.
 
 ### Tools (Lead) — `lib/terminal/tools.js`
 
 | Tool | Args | Mutating | Behaviour |
 | --- | --- | --- | --- |
-| `remote_shell_open` | `{ host, cwd? }` | no | Open a persistent PTY session; returns sessionId, host, status, motd. Denied for allowHosts-blocked hosts. |
+| `remote_shell_open` | `{ host, cwd? }` | no | Open or reuse the conversation+host PTY; when the native relay is enabled this is the exact PTY shown in DSH's terminal. Returns sessionId, host, status, startup output, and sharedTerminal. Denied for allowHosts-blocked hosts. |
 | `remote_shell_send` | `{ sessionId, text, submit? }` | per classifier | Send text (Enter default true) and wait for idle/timeout/exit; output delta + wait reason. When `submit` is true, classify the text like a command: mutating/unknown needs approval; read-only runs; `never` denies mutating; read-only hosts deny mutating. `submit: false` (raw control input) is allowed. |
 | `remote_shell_read` | `{ sessionId, offset?, count? }` | no | Bounded scrollback page (newest-relative). |
 | `remote_shell_signal` | `{ sessionId, signal }` | yes | INT/TERM/KILL/TSTP/HUP; approval under auto/always, denied under never/readonly hosts. |
@@ -505,16 +515,17 @@ channel closes.
 
 All six only register when `config.terminalEnabled` is true; they are registered
 by `lib/index.js` with the manager, approval gate, and cwd resolver. Prompt
-section explains: sessions are remote, persistent, line-oriented (no full-screen
-TUI), sends are bounded, one send at a time, close when done.
+section explains the one-session-per-conversation+host rule, shared native PTY
+when available, approval checks for Agent-submitted lines, and direct human
+intervention. Agent scrollback is ANSI-sanitized text; full-screen TUI rendering
+and human keystrokes belong in DSH's native terminal.
 
 ### User-facing live terminal pane (docs only)
 
-DSH's right-sidebar user terminal runs a configured shell profile
-(`api-terminal-controller` config `shell: {path, name, args}`). `scripts/dsh-remote-shell`
-is an interactive host picker that `ssh -t`s to a chosen `~/.ssh/config` host, so
-a user can make the sidebar terminal a live remote terminal with one profile
-patch (documented in README; not enabled automatically).
+When `userTerminal: true`, the plugin connects DSH's native right-sidebar
+terminal to the Host relay through `lib/terminal/bridge.cjs`; the Host owns the
+real SSH PTY. The older `scripts/dsh-remote-shell` host picker remains a
+standalone fallback but is not used by the plugin panel.
 
 ### Terminal implementation notes (v0.2, as verified)
 
@@ -547,17 +558,28 @@ patch (documented in README; not enabled automatically).
   accepts the requested window, forwards data/signals/exit status, and records
   `shellSessions` diagnostics, but it is not a byte-exact terminal and does not
   emulate terminal line discipline. Real remotes exercise a true PTY via ssh2.
+- **Shared PTY handoff.** `relay.acquireAgentPty({ hostName, sessionId })` returns
+  the same relay-owned PTY and replay snapshot. It subscribes/buffers output and
+  exit events before returning so there is no gap before the manager attaches;
+  Agent attachment preserves native-terminal dimensions. A relay entry marked
+  `agentOwned` ignores idle TTL, and an unexpected PTY exit becomes `error`
+  without auto-reconnecting into a fresh shell. `remote_shell_close` / Agent
+  disposal closes the exact relay entry.
+- **Human control is direct.** The xterm bridge forwards typed bytes (including
+  Ctrl-C) directly to the same PTY. These keystrokes bypass Agent approval as
+  operator actions and are not recorded in audit payloads; Agent-submitted lines
+  continue through the existing classifier/approval gate.
 - **The desktop "Persistent terminals" bundle is not required.** The shell
-  surface is self-contained (own owner-scoped manager) because `ctx.terminals`
-  is not mounted by default in Web/Desktop and is absent from the headless
-  profile.
+  surface remains self-contained because `ctx.terminals` is not mounted by
+  default in Web/Desktop and is absent from the headless profile.
 
 ## Management UI (v0.3): "Remote Ops" page in the DSH Web GUI
 
 The user-facing surface is a first-level sidebar panel ("Remote Ops" / 远程运维)
-registered by the plugin's browser half, which renders host inventory, live shell
-sessions, connection tests, and a recent-operations audit from a small Host HTTP
-API.
+registered by the plugin's browser half. It uses a connection rail to select a
+host and a focused host workbench for connection state/actions, alongside live
+shell sessions, connection tests, and a recent-operations audit from a small Host
+HTTP API.
 
 ### Host HTTP API — `lib/api.js`
 
@@ -644,7 +666,7 @@ window.__ModuleLoader__.load({ id: "dsh-remote", factory(require) { … return {
   loader's factory form and `require("react")` only; it is declared through
   `package.json#dsh.client = { platform: "web", inject: [] }` and exported as
   `./client`. The host serves it from the profile's
-  `node_modules/dsh-remote/lib/client.js`; a development loop
+  `node_modules/@aide-family/dsh-remote/lib/client.js`; a development loop
   (`scripts/dev-web-test.mjs`) boots an isolated Web profile in `.dsh-test`,
   drives Chrome with playwright-core, and writes a screenshot.
 - **Slot registration must wait for the owner.** Registering into
@@ -671,13 +693,9 @@ window.__ModuleLoader__.load({ id: "dsh-remote", factory(require) { … return {
 - **Admin session surface.** The page's session list/close use the manager's
   owner-agnostic `adminList/adminGet/adminRead/adminClose` (documented in the
   terminal module as management-UI-only); agent tools keep exact-Agent fencing.
-- **Browser verification.** The checked-in `docs/assets/management-page.png` was
-  captured from a running DSH Web profile: the sidebar row and page render, the
-  overview API returns the real `~/.ssh/config` hosts, a per-row "测试连接"
-  reached a real SSH host (`连接正常 316ms · Linux … moon`), and the audit table
-  showed the six operations produced by a real headless agent run (including a
-  fail-closed `denied` high-risk `rm -rf`). No browser console errors and no
-  failed HTTP responses were reported.
+- **Browser verification.** Use an isolated fixture-only DSH Web profile to
+  verify inventory, connection probes and audit rendering. Historical captures
+  containing real connection details were removed; do not publish live inventory.
 
 ## Live terminal mirror (v0.4): agent commands streamed into a right-sidebar terminal
 
@@ -793,10 +811,9 @@ command of the session).
 - **Browser verification** (`scripts/dev-web-test.mjs`, liveui work): the tab
   type registers through `ctx.sidebarRightTabs` + `sidebar.right.pane.tab`,
   auto-opens on the first live `start` for the session, renders the SSE frames
-  in a monospaced terminal-like log, and the checked-in screenshot
-  `docs/assets/remote-terminal.png` was captured from a real DSH Web profile
-  using the dev-only `live.emit` management method (`devLiveEvents: true` in the
-  dev profile only).
+  in a monospaced terminal-like log using the dev-only `live.emit` management
+  method (`devLiveEvents: true` in the dev profile only). Keep captures local
+  until their inventory and output have been reviewed for privacy.
 
 ### Client panel registration (v0.4, as verified by the browser loop)
 
@@ -825,8 +842,8 @@ command of the session).
   commands (two hosts), checks auto-open/已连接/command+output text/count,
   session and host filters, internal scrolling and bottom-follow semantics,
   scrolled-up freeze + jump back, and Clear; it fails non-zero on any
-  console.error/pageerror/HTTP≥400. `docs/assets/remote-terminal.png` is the
-  captured result; browser diagnostics were empty.
+  console.error/pageerror/HTTP≥400. Browser diagnostics were empty in the
+  historical verification run; its screenshot is no longer distributed.
 
 ## Interactive user SSH terminal + host management (v0.5)
 
@@ -960,6 +977,7 @@ relay.socketPath
   sessionKey, host: "prod-web-1", target: "ops@10.0.0.11:22", sessionId: "<conversation>",
   state: "connecting" | "connected" | "reconnecting" | "closed" | "error",
   attached: 0,                 // connected bridge clients
+  sharedWithAgent: false,      // whether the Agent manager owns this exact PTY
   reconnectAttempt: 0,
   cols: 120, rows: 40,
   createdAt, updatedAt,
@@ -969,21 +987,23 @@ relay.socketPath
 ```
 
 Behavior:
-- `open` reuses a live session for the same key (this is the per-conversation SSH
-  reuse); a closed/errored session is replaced. It resolves the host through
-  `hosts.find`, rejects a disallowed (`allowHosts`) host with `code: "HOST_DISALLOWED"`,
-  and opens `transport.openPty(host, { cols, rows, term: "xterm-256color" })`.
+- `open` reuses a live session for the same key (per-conversation PTY reuse); a
+  closed/errored session is replaced. It resolves the host through `hosts.find`,
+  rejects a disallowed (`allowHosts`) host with `code: "HOST_DISALLOWED"`, and
+  opens `transport.openPty(host, { cols, rows, term: "xterm-256color" })` when
+  needed. `acquireAgentPty` borrows that live handle and preserves its dimensions.
 - Output: every PTY text chunk is appended to a bounded replay buffer
   (`userTerminalScrollbackBytes`, default 400 000) and broadcast to attached
   bridges. A new bridge gets `ESC[2J ESC[3J ESC[H` + the replay tail first.
-- Auto-reconnect: an unexpected PTY exit/socket error sets `reconnecting`, writes
-  a yellow banner into the stream, and retries with backoff 1s/2s/4s/8s/16s/30s
-  up to `userTerminalReconnectAttempts` (default 5). A successful retry opens a
-  new PTY, sets `connected`, writes `[dsh-remote] SSH 连接已恢复`, and keeps the
-  bridge attached. Exhausted attempts → `error` + final banner.
+- Auto-reconnect applies only before an Agent acquires the session: an unexpected
+  terminal-only PTY exit sets `reconnecting`, writes a yellow banner, and retries
+  with backoff 1s/2s/4s/8s/16s/30s up to `userTerminalReconnectAttempts` (default
+  5). After `agentOwned` is set, an exit becomes `error` and does not start a new
+  shell; opening a new shell must be an explicit action.
 - A bridge disconnect does not close the session. After the last bridge detaches,
-  `userTerminalTtlMs` (default 1 800 000; 0 disables) starts; expiry closes the
-  session (audit `close`). `close()` closes the PTY channel only.
+  `userTerminalTtlMs` (default 1 800 000; 0 disables) starts only while no Agent
+  owns the PTY; an Agent-owned session remains until shell close/Agent disposal.
+  `close()` closes the PTY channel only.
 - Socket: `$DSH_HOME/remote/terminal.sock` (dir 0700, socket 0600) on POSIX;
   `\\.\pipe\dsh-remote-terminal-<sha1 of DSH_HOME>` on Windows. A stale socket
   file is unlinked after verifying it is a socket; a second listener start on a
@@ -1054,15 +1074,26 @@ still works without the terminal plugins):
 // runtimeCtx = the client plugin's root context captured in apply()
 async function openNativeTerminal(sessionId, command) {
   const right = runtimeCtx.sidebarRight, terminals = runtimeCtx.webTerminals;
-  if (!right || !terminals || typeof right.openTabIn !== "function") throw new Error("终端服务不可用");
-  const tabs = right.openTabs;                       // snapshot store
-  const before = new Set((tabs.getSnapshot() ?? []).map((tab) => tab.id));
-  right.openTabIn(sessionId, "terminal", {});        // DSH's native terminal type
-  const tabId = await waitFor(() => (tabs.getSnapshot() ?? [])
-    .find((tab) => tab.kind === "terminal" && !before.has(tab.id)), 5000);
-  const nav = right.tabDomain.occurrence(sessionId, { id: tabId }).navigation.getSnapshot();
-  const view = terminals.view(sessionId, tabId, nav.address, undefined, undefined);
-  await waitForState(view, (state) => state.writable === true, 20000);
+  if (!right || !terminals || typeof right.openTab !== "function") throw new Error("终端服务不可用");
+  await revealConversation(sessionId);              // return main column + await its paint
+  await waitFor(() => right.mounted.getSnapshot() === sessionId, 5000);
+  const tabs = right.openTabs;                       // GLOBAL inventory; tab ids are SESSION-local
+  const before = new Set((tabs.getSnapshot() ?? [])
+    .filter((tab) => tab.sessionId === sessionId).map((tab) => tab.tabId));
+  const token = uniqueBridgeOpenToken();             // non-secret navigation correlation
+  right.openTab("terminal", { params: { dshRemoteBridge: token } }); // exactly once; public open fails loudly
+  const tab = await waitFor(() => (tabs.getSnapshot() ?? [])
+    .find((tab) => tab.sessionId === sessionId && tab.kind === "terminal" && !before.has(tab.tabId)
+      && right.tabDomain.occurrence(sessionId, { id: tab.tabId })
+        .navigation.getSnapshot().params?.dshRemoteBridge === token), 5000);
+  const tabId = tab.tabId;
+  const occurrence = right.tabDomain.occurrence(sessionId, { id: tabId });
+  const nav = occurrence.navigation.getSnapshot();
+  const view = terminals.view(sessionId, tabId, nav.address, nav.params?.terminalId, nav.params?.shellPath);
+  // Native UI alone owns mount/dispose/render ACKs. Abort before writing if the
+  // occurrence is removed or the user switches conversation.
+  await waitForState(view, (state) => state.phase === "connected"
+    && state.info?.state === "running" && state.writable === true, 20000);
   view.write(command + "\r");
 }
 ```
@@ -1125,8 +1156,8 @@ await conversation.send(`已连接远程主机 ${name}（${target}）。请在�
   `printf 'terminal-ok\n'`, asserts the output plus the injected user message,
   exercises the audit modal (the agent-run commands appear under the host), the
   host form (create/edit/delete round-trip) and captures updated screenshots.
-- `docs/assets/management-page.png` and `docs/assets/remote-terminal.png` are
-  regenerated by that run.
+- Browser screenshots are local verification artifacts, not package assets.
+  Only publish reviewed fixture-only captures with synthetic output.
 - A packaged tarball install must include `bin/` and `lib/terminal/bridge.cjs`.
 
 ### v0.5 implementation notes (as verified)
@@ -1351,3 +1382,92 @@ navigated conversation, and every failure after navigation must stay visible.
   (`startSession` before `terminal.open` with the new id), the fallbacks, the
   pending-panel-notice path (visible command + copy after navigation), and the
   permanent 复制连接命令 button.
+
+## v0.5.3 — safe bridge launch and truthful SSH attach verification
+
+### Feasibility assessment and revised plan
+
+The client bundle runs in DSH's browser renderer. It can ask DSH to open its
+native terminal tab and use `webTerminals.view(...).write(...)`, but it has no
+browser-side OS process-spawn API. Therefore the plugin **cannot start a literal
+local `ssh` process without DSH adding a native spawn/terminal-profile API**. The
+supported design remains: `terminal.open` establishes the SSH PTY in the DSH
+Host process (`ssh2`), and one local bridge process in the native xterm connects
+to that PTY over the user-only socket. This is an interactive SSH terminal, but
+not OpenSSH running in the terminal process itself.
+
+`webTerminals.write()` also has no command-execution acknowledgement. The revised
+plan is to write the quoted bridge-launch line once and only claim success after
+observable relay evidence; if that cannot be observed, surface the command for
+manual recovery rather than replaying it. The old automatic retries at ~2s/~4s
+were removed: a retry racing with bridge startup can become input to the already
+connected remote shell.
+
+### Attach contract
+
+- `openNativeTerminal` passes the relay snapshot returned by `terminal.open` as
+  the baseline. Success requires `state === "connected"`, `attached >= 1`, and
+  `attachCount` to have advanced past the baseline (older backends without the
+  counter may only prove a first attach when the baseline had `attached === 0`).
+- When no new attach appears within 10 seconds, the operation fails visibly with
+  the copyable command and bridge log path; it does not send the conversation
+  handoff and never claims that a local shell is connected.
+- This is evidence of a newly attached bridge and a currently connected relay,
+  not an ACK from the browser terminal API that `write()` delivered every byte.
+  A future DSH-native spawn/execute API would be required to remove terminal
+  command injection entirely.
+
+## v0.5.6 — native terminal identity fix
+
+The successful SSH password login exposed a separate browser-side defect:
+`sidebarRight.openTabs` inventories every session, but `tabId` is minted by a
+session-local counter. A global `Set(tabId)` could reject a real new `tab2`
+because another session already had `tab2`. The historical 800ms `openTabIn`
+retry then created a second terminal while still missing both tabs.
+
+The current opener filters both baseline and candidates by the target session,
+correlates the requested tab through a non-secret navigation token, and calls
+public `openTab` exactly once after revealing the conversation. Slow inventory
+publication never triggers another open. Public open reports an unadopted
+surface instead of silently doing nothing. Closed occurrences, session switches,
+and native startup failures stop the flow before bridge input. It borrows the
+same five-argument `webTerminals.view` as the native UI without taking ownership
+of model mount, dispose, or render acknowledgements. Bridge input remains
+one-shot and success still requires a new relay attachment.
+
+Regression tests reproduce identical tab ids across different sessions,
+publication beyond 800ms, simultaneous unrelated opens, no publication,
+unadopted surfaces, closing/switching/failure before input, and relay attach
+timeout; every failure leaves the single-open/single-write limit intact.
+
+## v0.6.0 — configurable connection actions
+
+A terminal-only shortcut now declares `viaHost` and ordered `actions`, replacing
+the fixed sww command. Legacy profiles migrate to a command with the original
+root-on-target completion check. The entrance's SSH credentials, allowHosts and
+read-only restrictions remain inherited; one-shot exec/probe/SFTP are still
+blocked for shortcuts.
+
+The relay authorizes all sends before opening the channel and rechecks the
+normalized profile with its original policy context before initialization.
+Commands/text/keys use the existing risk gate, including assembled text followed
+by Enter; editing/history makes the result unproven, not statically read-only.
+Waits and delays do not grant execution authority. No synthetic Agent or implicit
+approval is created when the user saves a flow.
+
+After entrance authentication, an ordinary flow waits for the entry shell prompt.
+A first literal wait can instead select menu/custom-prompt readiness. Each action
+sends at most once and completes on its configured output condition or input/timer
+completion. A continuously subscribed, bounded ANSI-sanitized monitor captures
+synchronous output, consumes literal matches without losing their suffix, and
+isolates fresh command output from earlier prompts. Timeouts, aborts and PTY exit
+fail-stop without sending remaining actions; the whole sequence is bounded to
+20 minutes. Prompt return alone is not an exit-code or target-success proof.
+
+Only full completion changes `loginState` to confirmed. Relay snapshots expose
+safe `actionProgress` counts/type/label; custom command/text/key bytes are not
+logged as initialization audit subjects. The native UI retains PTY model lifecycle
+ownership; adopting an initialized PTY does not replay actions. Host APIs persist
+validated action arrays and defensively copy every row. The editor supports all
+five types, sorting, bounded timeouts, literal completion and legacy target-root
+checks, and never presents incomplete progress as connected.

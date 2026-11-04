@@ -18,6 +18,8 @@ import {
   createTerminalRelay,
   defaultRelaySocketPath,
 } from '../../lib/terminal/relay.js'
+import { createShellManager } from '../../lib/terminal/manager.js'
+import { createPtySession } from '../../lib/terminal/pty-session.js'
 
 const QUIET_LOGGER = { debug() {}, info() {}, warn() {}, error() {} }
 
@@ -182,7 +184,7 @@ async function makeRelay(t, options = {}) {
   }
   const relay = createTerminalRelay({
     transport,
-    hosts: makeHosts({ hosts: options.hosts, allowed: options.allowed }),
+    hosts: options.hostStore ?? makeHosts({ hosts: options.hosts, allowed: options.allowed }),
     config: makeConfig(options.config),
     audit,
     logger: QUIET_LOGGER,
@@ -349,6 +351,7 @@ test('relay: open builds the shell command and a JSON-safe session view', async 
     attachCount: 0,
     lastAttachAt: null,
     lastDetachAt: null,
+    sharedWithAgent: false,
   })
   assert.equal(typeof opened.session.createdAt, 'number')
   assert.equal(transport.opens.length, 1)
@@ -782,6 +785,96 @@ test('relay: dispose while a bridge is attached is quiescent (never deadlocks)',
   assert.deepEqual(relay.list(), [])
 })
 
+test('relay + Agent shell manager: native terminal and Agent use one persistent PTY', async (t) => {
+  const config = {
+    ...makeConfig({ userTerminalTtlMs: 25 }),
+    terminalIdleSilenceMs: 30,
+    terminalTimeoutMs: 500,
+    terminalStartupTimeoutMs: 1_000,
+    terminalScrollbackLines: 200,
+    terminalScrollbackBytes: 20_000,
+    terminalMaxReadBytes: 4_096,
+    terminalCols: 80,
+    terminalRows: 24,
+  }
+  const { relay, transport } = await makeRelay(t, { config })
+  const manager = createShellManager({ transport, relay, config, logger: QUIET_LOGGER })
+  t.after(() => manager.dispose())
+
+  const conversationId = 'conversation-shared'
+  const agent = { id: 'agent-runtime-id', session: { id: conversationId } }
+  const host = makeHost('alpha')
+  const [, opened, raced] = await Promise.all([
+    relay.open({ hostName: 'alpha', sessionId: conversationId }),
+    manager.open({ agent, host }),
+    manager.open({ agent, host }),
+  ])
+  assert.equal(opened.sessionId, raced.sessionId, 'simultaneous opens join one Agent shell')
+  assert.equal(opened.sharedTerminal, true)
+  assert.equal(transport.opens.length, 1, 'only one remote PTY is allocated')
+  const pty = transport.ptys[0]
+  assert.deepEqual(pty.resizes, [], 'Agent attachment preserves the native terminal dimensions')
+
+  // The DSH-native terminal uses relay.open for the same conversation+host key.
+  const native = await relay.open({ hostName: 'alpha', sessionId: conversationId })
+  assert.equal(native.session.sessionKey, `${conversationId}::alpha`)
+  assert.equal(native.session.sharedWithAgent, true)
+  assert.equal(transport.opens.length, 1, 'opening the native terminal reuses the Agent PTY')
+
+  const send = manager.send({ agent, sessionId: opened.sessionId, text: 'echo from-agent' })
+  await waitFor(() => pty.writes.some((write) => write.startsWith('echo from-agent')), { label: 'Agent input on canonical PTY' })
+  pty.emit('agent-output\r\n')
+  const agentResult = await send
+  assert.match(agentResult.viewport, /agent-output/u)
+  assert.equal(transport.opens.length, 1)
+
+  // Attach the DSH bridge after Agent output and verify relay replay uses that
+  // same channel, not a second SSH shell.
+  const bridge = await attachBridge(relay.socketPath, { host: 'alpha', sessionId: conversationId })
+  await waitForText(bridge, 'agent-output')
+  await waitFor(() => relay.list({ sessionId: conversationId })[0]?.attached === 1)
+
+  bridge.socket.write(`${JSON.stringify({ t: 'i', d: Buffer.from('echo from-human\r').toString('base64') })}\n`)
+  await waitFor(() => pty.writes.some((write) => write.startsWith('echo from-human')), { label: 'human input on canonical PTY' })
+  pty.emit('human-output\r\n')
+  assert.match(manager.read({ agent, sessionId: opened.sessionId }).text, /human-output/u)
+
+  const interrupted = manager.send({ agent, sessionId: opened.sessionId, text: 'sleep 60' })
+  await waitFor(() => pty.writes.some((write) => write.startsWith('sleep 60')), { label: 'long-running Agent send' })
+  bridge.socket.write(`${JSON.stringify({ t: 'i', d: Buffer.from('\u0003').toString('base64') })}\n`)
+  await waitFor(() => pty.writes.includes('\u0003'), { label: 'human Ctrl-C on shared PTY' })
+  pty.emit('^C\r\n$ ')
+  const interruptedResult = await interrupted
+  assert.match(interruptedResult.viewport, /\^C/u)
+  assert.equal(transport.opens.length, 1)
+
+  // Detaching the xterm does not idle-close a shell the Agent still owns.
+  detachBridge(bridge)
+  await waitFor(() => relay.list({ sessionId: conversationId })[0]?.attached === 0)
+  await new Promise((resolve) => setTimeout(resolve, 60))
+  assert.equal(relay.list({ sessionId: conversationId }).length, 1)
+  assert.equal(pty.closeCalls, 0)
+
+  await manager.close({ agent, sessionId: opened.sessionId })
+  assert.equal(pty.closeCalls, 1)
+  assert.deepEqual(relay.list({ sessionId: conversationId }), [])
+})
+
+test('relay: Agent PTY acquisition buffers output until the owner subscribes', async (t) => {
+  const { relay, transport } = await makeRelay(t)
+  const acquired = await relay.acquireAgentPty({ hostName: 'alpha', sessionId: 'conversation-handoff' })
+  const pty = transport.ptys[0]
+  pty.emit('between-acquire-and-subscribe\r\n')
+  const session = createPtySession({
+    pty: acquired.pty,
+    initialOutput: acquired.initialOutput,
+    config: { terminalIdleSilenceMs: 30, terminalStartupTimeoutMs: 1_000, terminalScrollbackLines: 100 },
+  })
+  await session.start()
+  assert.match(session.read().text, /between-acquire-and-subscribe/u)
+  await session.close('handoff test done')
+})
+
 test('relay: a throwing audit/logger never breaks a session or its handlers', async (t) => {
   const explosive = {
     record() {
@@ -833,5 +926,332 @@ test('relay: a throwing audit/logger never breaks a session or its handlers', as
   const sessionKey = relay.list()[0].sessionKey
   assert.equal(await relay.close(sessionKey), true)
   assert.equal(await relay.close(sessionKey), false)
+  assert.deepEqual(relay.list(), [])
+})
+
+// Cluster shortcuts initialize the canonical channel, never a second shell.
+test('relay: cluster login runs once, is confirmed, and Agent adoption does not repeat it', async (t) => {
+  const shortcut = makeHost('cluster-a', { viaHost: 'bastion-demo', loginCommand: 'sww -r -u demo.user cluster-a' })
+  const transport = makeTransport()
+  const originalOpen = transport.openPty
+  transport.openPty = async (...args) => {
+    const pty = await originalOpen(...args)
+    pty.write = (text) => { pty.writes.push(text); pty.emit('\r\nroot@web1.cluster-a.example.test:~# ') }
+    setImmediate(() => pty.emit('[demo.user@entry-demo ~]$ '))
+    return pty
+  }
+  const { relay, audit } = await makeRelay(t, { transport, hosts: [shortcut], config: { policy: 'auto' } })
+  const [first, concurrent] = await Promise.all([
+    relay.open({ hostName: 'cluster-a', sessionId: 'conv-login' }),
+    relay.open({ hostName: 'cluster-a', sessionId: 'conv-login' }),
+  ])
+  assert.equal(first.session.loginState, 'confirmed')
+  assert.equal(first.shell.host.viaHost, 'bastion-demo')
+  assert.equal(concurrent.session.sessionKey, first.session.sessionKey)
+  await relay.open({ hostName: 'cluster-a', sessionId: 'conv-login' })
+  await relay.acquireAgentPty({ hostName: 'cluster-a', sessionId: 'conv-login' })
+  assert.equal(transport.opens.length, 1)
+  assert.deepEqual(transport.ptys[0].writes, [shortcut.loginCommand + '\r'])
+  assert.equal(audit.entries.filter(e => e.tool === 'terminal.login').length, 2)
+})
+
+test('relay: blocked automatic login does not open an entry SSH channel', async (t) => {
+  const shortcut = makeHost('cluster-a', { viaHost: 'bastion-demo', loginCommand: 'sww -r -u demo.user cluster-a' })
+  const { relay, transport } = await makeRelay(t, { hosts: [shortcut], config: { policy: 'never' } })
+  await assert.rejects(relay.open({ hostName: 'cluster-a', sessionId: 'conv-denied' }), /Connection action 1\/1 \(command\): Denied by the connection action policy/)
+  assert.equal(transport.opens.length, 0)
+  assert.equal(relay.list().length, 0)
+})
+
+test('relay: missing entry prompt times out, closes the channel and never sends sww', async (t) => {
+  const shortcut = makeHost('cluster-a', { viaHost: 'bastion-demo', loginCommand: 'sww -r -u demo.user cluster-a' })
+  const { relay, transport } = await makeRelay(t, { hosts: [shortcut], config: { policy: 'auto', connectTimeoutMs: 15 } })
+  await assert.rejects(relay.open({ hostName: 'cluster-a', sessionId: 'conv-failed' }), /entry host shell prompt/)
+  assert.deepEqual(transport.ptys[0].writes, [])
+  assert.equal(transport.ptys[0].closed, true)
+  assert.equal(relay.list().length, 0)
+})
+
+test('relay: dispose cancels cluster startup without publishing a connected session', async (t) => {
+  const shortcut = makeHost('cluster-a', { viaHost: 'bastion-demo', loginCommand: 'sww -r -u demo.user cluster-a' })
+  const { relay, transport } = await makeRelay(t, { hosts: [shortcut], config: { policy: 'auto', connectTimeoutMs: 500 } })
+  const opening = relay.open({ hostName: 'cluster-a', sessionId: 'conv-cancel' })
+  const rejected = assert.rejects(opening, /cancelled|disposed/)
+  await waitFor(() => transport.ptys.length === 1 && transport.ptys[0].dataListeners.size > 1)
+  await relay.dispose()
+  await rejected
+  assert.equal(transport.ptys[0].closed, true)
+})
+
+function clusterHost() {
+  return makeHost('cluster-a', { viaHost: 'bastion-demo', loginCommand: 'sww -r -u demo.user cluster-a' })
+}
+
+function loginTransport({ failReconnect = false, synchronousPrompt = false } = {}) {
+  const transport = makeTransport()
+  const openPty = transport.openPty
+  transport.openPty = async (...args) => {
+    const pty = await openPty(...args)
+    pty.write = text => {
+      pty.writes.push(text)
+      if (!text.startsWith('sww ')) return
+      if (failReconnect && transport.opens.length > 1) pty.emitExit()
+      else pty.emit('\r\nroot@web1.cluster-a.example.test:~# ')
+    }
+    if (synchronousPrompt) {
+      const subscribe = pty.onData.bind(pty)
+      let replayed = false
+      pty.onData = callback => {
+        const off = subscribe(callback)
+        if (!replayed) { replayed = true; callback('[ops@entrance ~]$ ') }
+        return off
+      }
+    } else setImmediate(() => pty.emit('[ops@entrance ~]$ '))
+    return pty
+  }
+  return transport
+}
+
+test('relay: synchronous entry prompt replay initializes login without waiting for more data', async t => {
+  const { relay, transport } = await makeRelay(t, { hosts: [clusterHost()], transport: loginTransport({ synchronousPrompt: true }), config: { policy: 'auto', connectTimeoutMs: 100 } })
+  const opened = await relay.open({ hostName: 'cluster-a', sessionId: 'sync-prompt' })
+  assert.equal(opened.session.loginState, 'confirmed')
+  assert.deepEqual(transport.ptys[0].writes, [clusterHost().loginCommand + '\r'])
+})
+
+test('relay: login exits during reconnect respect the retry cap without duplicate scheduling', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const { relay, transport, audit } = await makeRelay(t, { hosts: [clusterHost()], transport: loginTransport({ failReconnect: true }), config: { policy: 'auto', userTerminalReconnectAttempts: 2 } })
+  await relay.open({ hostName: 'cluster-a', sessionId: 'retry-login' })
+  transport.ptys[0].emitExit()
+  t.mock.timers.tick(1000)
+  await waitFor(() => audit.entries.filter(e => e.action === 'reconnect').length === 1)
+  assert.equal(relay.list()[0].reconnectAttempt, 1)
+  t.mock.timers.tick(2000)
+  await waitFor(() => relay.list()[0].state === 'error')
+  assert.equal(relay.list()[0].reconnectAttempt, 2)
+  t.mock.timers.tick(1000000)
+  assert.equal(transport.opens.length, 3)
+  assert.equal(audit.entries.filter(e => e.action === 'reconnect').length, 2)
+})
+
+test('relay: revoked entrance permission prevents every reconnect channel and login', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  let allowed = true
+  let finds = 0
+  const hostStore = { async find() { finds++; return clusterHost() }, isAllowed: () => allowed }
+  const { relay, transport, audit } = await makeRelay(t, { hostStore, transport: loginTransport(), config: { policy: 'auto', userTerminalReconnectAttempts: 2 } })
+  await relay.open({ hostName: 'cluster-a', sessionId: 'revoked' })
+  allowed = false
+  transport.ptys[0].emitExit()
+  t.mock.timers.tick(1000)
+  await waitFor(() => audit.entries.filter(e => e.action === 'reconnect').length === 1)
+  t.mock.timers.tick(2000)
+  await waitFor(() => relay.list()[0].state === 'error')
+  assert.equal(transport.opens.length, 1)
+  assert.equal(finds, 4, 'initial lookup, initial connect, then both reconnect policy lookups')
+  assert.match(relay.list()[0].lastError, /allowHosts/)
+})
+
+test('relay: human Ctrl-C cancels automatic login while arbitrary startup input is not queued', async t => {
+  const { relay, transport } = await makeRelay(t, { hosts: [clusterHost()], config: { policy: 'auto', connectTimeoutMs: 1000 } })
+  const opening = relay.open({ hostName: 'cluster-a', sessionId: 'human-cancel' })
+  const rejected = assert.rejects(opening, /cancelled/)
+  await waitFor(() => transport.ptys.length === 1 && transport.ptys[0].dataListeners.size > 1)
+  const bridge = await attachBridge(relay.socketPath, { host: 'cluster-a', sessionId: 'human-cancel' })
+  await waitFor(() => relay.list()[0]?.attached === 1)
+  bridge.socket.write(JSON.stringify({ t: 'i', d: Buffer.from('echo forbidden\r').toString('base64') }) + '\n')
+  bridge.socket.write(JSON.stringify({ t: 'i', d: Buffer.from('\u0003').toString('base64') }) + '\n')
+  await rejected
+  assert.deepEqual(transport.ptys[0].writes, ['\u0003'])
+  assert.equal(transport.ptys[0].closed, true)
+})
+
+test('relay: cancelling a shared startup reuser does not cancel the creator or send extra login', async t => {
+  const { relay, transport } = await makeRelay(t, { hosts: [clusterHost()], config: { policy: 'auto', connectTimeoutMs: 1000 } })
+  const creator = relay.open({ hostName: 'cluster-a', sessionId: 'cancel-reuser' })
+  await waitFor(() => transport.ptys.length === 1 && transport.ptys[0].dataListeners.size > 1)
+  const controller = new AbortController()
+  const reuser = relay.open({ hostName: 'cluster-a', sessionId: 'cancel-reuser', signal: controller.signal })
+  const rejected = assert.rejects(reuser, /cancelled/)
+  controller.abort()
+  await rejected
+  assert.equal(transport.ptys[0].closed, false)
+  transport.ptys[0].write = text => { transport.ptys[0].writes.push(text); transport.ptys[0].emit('\r\nroot@web1.cluster-a.example.test:~# ') }
+  transport.ptys[0].emit('[ops@entrance ~]$ ')
+  assert.equal((await creator).session.loginState, 'confirmed')
+  assert.equal(transport.opens.length, 1)
+  assert.equal(transport.ptys[0].writes.length, 1)
+})
+
+test('manager: creator cancellation reaches shared login and closes only the new channel', async t => {
+  const host = clusterHost()
+  const { relay, transport } = await makeRelay(t, { hosts: [host], config: { policy: 'auto', connectTimeoutMs: 1000 } })
+  const manager = createShellManager({ transport, relay, config: { terminalStartupTimeoutMs: 1000 } })
+  t.after(() => manager.dispose())
+  const controller = new AbortController()
+  const opening = manager.open({ agent: { session: { id: 'manager-creator' } }, host, signal: controller.signal })
+  const rejected = assert.rejects(opening, /cancelled/)
+  await waitFor(() => transport.ptys.length === 1 && transport.ptys[0].dataListeners.size > 1)
+  controller.abort()
+  await rejected
+  assert.equal(transport.ptys[0].closed, true)
+  assert.deepEqual(transport.ptys[0].writes, [])
+  assert.deepEqual(relay.list(), [])
+})
+
+test('manager: cancellation during adoption preserves an existing human terminal', async t => {
+  const { relay, transport } = await makeRelay(t)
+  await relay.open({ hostName: 'alpha', sessionId: 'human-adoption' })
+  const manager = createShellManager({ transport, relay, config: { terminalIdleSilenceMs: 500, terminalStartupTimeoutMs: 1000 } })
+  t.after(() => manager.dispose())
+  const controller = new AbortController()
+  const opening = manager.open({ agent: { session: { id: 'human-adoption' } }, host: makeHost('alpha'), signal: controller.signal })
+  const rejected = assert.rejects(opening, /cancelled|abort/i)
+  await waitFor(() => transport.ptys[0].dataListeners.size > 1)
+  controller.abort()
+  await rejected
+  assert.equal(transport.ptys[0].closed, false)
+  assert.equal(relay.list()[0].state, 'connected')
+  assert.equal(relay.list()[0].sharedWithAgent, false)
+  assert.equal(transport.ptys[0].dataListeners.size, 1)
+  assert.equal(transport.opens.length, 1)
+})
+
+test('relay: creator cancellation aborts transport startup before any PTY or login', async t => {
+  let transportSignal
+  const transport = { opens: 0, async openPty(_host, options) {
+    this.opens++
+    transportSignal = options.signal
+    return new Promise((_resolve, reject) => options.signal.addEventListener('abort', () => reject(new Error('transport cancelled')), { once: true }))
+  } }
+  const { relay } = await makeRelay(t, { transport, hosts: [clusterHost()], config: { policy: 'auto' } })
+  const controller = new AbortController()
+  const opening = relay.open({ hostName: 'cluster-a', sessionId: 'transport-cancel', signal: controller.signal })
+  const rejected = assert.rejects(opening, /cancelled/)
+  await waitFor(() => transportSignal)
+  controller.abort()
+  await rejected
+  assert.equal(transportSignal.aborted, true)
+  assert.deepEqual(relay.list(), [])
+})
+
+test('relay: reconnect refreshes changed entrance coordinates rather than retaining stale host', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  let current = makeHost('alpha', { host: '192.0.2.1' })
+  const hostStore = { async find() { return current }, isAllowed: () => true }
+  const { relay, transport } = await makeRelay(t, { hostStore })
+  await relay.open({ hostName: 'alpha', sessionId: 'changed-entrance' })
+  current = makeHost('alpha', { host: '192.0.2.2', passwordEnv: 'NEW_PASSWORD_ENV' })
+  transport.ptys[0].emitExit()
+  t.mock.timers.tick(1000)
+  await waitFor(() => transport.opens.length === 2 && relay.list()[0].state === 'connected')
+  assert.equal(transport.opens[1].host.host, '192.0.2.2')
+  assert.equal(transport.opens[1].host.passwordEnv, 'NEW_PASSWORD_ENV')
+})
+
+test('relay: human cancellation during reconnect stops retries even if Ctrl-C emits a target prompt', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const transport = loginTransport()
+  const openPty = transport.openPty
+  transport.openPty = async (...args) => {
+    const pty = await openPty(...args)
+    if (transport.opens.length > 1) pty.write = text => {
+      pty.writes.push(text)
+      if (text === '\u0003') pty.emit('\r\nroot@web1.cluster-a.example.test:~# ')
+    }
+    return pty
+  }
+  const { relay, audit } = await makeRelay(t, { transport, hosts: [clusterHost()], config: { policy: 'auto', userTerminalReconnectAttempts: 3 } })
+  await relay.open({ hostName: 'cluster-a', sessionId: 'cancel-reconnect' })
+  const bridge = await attachBridge(relay.socketPath, { host: 'cluster-a', sessionId: 'cancel-reconnect' })
+  await waitFor(() => relay.list()[0]?.attached === 1)
+  transport.ptys[0].emitExit()
+  t.mock.timers.tick(1000)
+  await waitFor(() => transport.ptys[1]?.writes.length === 1)
+  bridge.socket.write(JSON.stringify({ t: 'i', d: Buffer.from('\u0003').toString('base64') }) + '\n')
+  await waitFor(() => relay.list()[0].state === 'error')
+  assert.equal(relay.list()[0].loginState, 'failed')
+  t.mock.timers.tick(1000000)
+  assert.equal(transport.opens.length, 2)
+  assert.equal(audit.entries.filter(e => e.tool === 'terminal.login' && e.detail.includes('all connection actions completed')).length, 1)
+  detachBridge(bridge)
+})
+
+test('manager: cancelling a coalesced waiter preserves the creating Agent operation', async t => {
+  const host = clusterHost()
+  const { relay, transport } = await makeRelay(t, { hosts: [host], config: { policy: 'auto', connectTimeoutMs: 1000 } })
+  const manager = createShellManager({ transport, relay, config: { terminalIdleSilenceMs: 30, terminalStartupTimeoutMs: 1000 } })
+  t.after(() => manager.dispose())
+  const agent = { session: { id: 'manager-waiter' } }
+  const creator = manager.open({ agent, host })
+  await waitFor(() => transport.ptys[0]?.dataListeners.size > 1)
+  const controller = new AbortController()
+  const waiter = manager.open({ agent, host, signal: controller.signal })
+  const rejected = assert.rejects(waiter, /cancelled/)
+  controller.abort()
+  await rejected
+  assert.equal(transport.ptys[0].closed, false)
+  transport.ptys[0].write = text => { transport.ptys[0].writes.push(text); transport.ptys[0].emit('\r\nroot@web1.cluster-a.example.test:~# ') }
+  transport.ptys[0].emit('[ops@entrance ~]$ ')
+  assert.equal((await creator).sharedTerminal, true)
+  assert.equal(transport.opens.length, 1)
+})
+
+test('relay: custom action sequence finishes once in canonical PTY with safe progress', async (t) => {
+  const command = 'choose-cluster action-value-not-a-log'
+  const actions = [
+    { type: 'command', value: command, expect: 'Selection:' },
+    { type: 'text', value: '1' },
+    { type: 'key', value: 'Enter' },
+    { type: 'wait', value: 'Target ready' },
+    { type: 'delay', durationMs: 1 },
+    { type: 'command', value: 'echo done' },
+  ]
+  const host = makeHost('target', { viaHost: 'bastion-demo', actions })
+  const transport = makeTransport()
+  const original = transport.openPty
+  transport.openPty = async (...args) => {
+    const pty = await original(...args)
+    pty.write = text => {
+      pty.writes.push(text)
+      if (text === command + '\r') pty.emit('\r\nSelection: ')
+      else if (text === '\r') pty.emit('\r\nTarget ready\r\n[ops@target ~]$ ')
+      else if (text === 'echo done\r') pty.emit('\r\ndone\r\n[ops@target ~]$ ')
+    }
+    setImmediate(() => pty.emit('[ops@entrance ~]$ '))
+    return pty
+  }
+  const { relay, audit } = await makeRelay(t, { transport, hosts: [host], config: { policy: 'auto' } })
+  const first = await relay.open({ hostName: 'target', sessionId: 'conv-actions' })
+  assert.equal(first.session.state, 'connected')
+  assert.equal(first.session.loginState, 'confirmed')
+  assert.equal(first.session.actionProgress.state, 'completed')
+  assert.equal(first.session.actionProgress.completed, actions.length)
+  assert.equal(first.shell.host.actionCount, actions.length)
+  await relay.open({ hostName: 'target', sessionId: 'conv-actions' })
+  await relay.acquireAgentPty({ hostName: 'target', sessionId: 'conv-actions' })
+  assert.equal(transport.opens.length, 1)
+  assert.deepEqual(transport.ptys[0].writes, [command + '\r', '1', '\r', 'echo done\r'])
+  assert.equal(JSON.stringify(audit.entries).includes(command), false)
+  assert.equal(JSON.stringify(first.session.actionProgress).includes(command), false)
+})
+
+test('relay: failed custom action never sends remaining commands or publishes ready', async (t) => {
+  const host = makeHost('target', { viaHost: 'bastion-demo', actions: [
+    { type: 'wait', value: 'Never arrives', timeoutMs: 100 },
+    { type: 'command', value: 'echo should-not-run' },
+  ] })
+  const transport = makeTransport()
+  const original = transport.openPty
+  transport.openPty = async (...args) => {
+    const pty = await original(...args)
+    setImmediate(() => pty.emit('[ops@entrance ~]$ '))
+    return pty
+  }
+  const { relay } = await makeRelay(t, { transport, hosts: [host], config: { policy: 'auto' } })
+  await assert.rejects(relay.open({ hostName: 'target', sessionId: 'conv-actions-fail' }), /timed out|Timed out|timeout/i)
+  assert.deepEqual(transport.ptys[0].writes, [])
+  assert.equal(transport.ptys[0].closed, true)
   assert.deepEqual(relay.list(), [])
 })

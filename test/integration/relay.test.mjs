@@ -21,6 +21,7 @@ import { fileURLToPath } from 'node:url'
 import { startSshServer } from '../fixtures/ssh-server.mjs'
 import { createSshTransport } from '../../lib/ssh/transport.js'
 import { createTerminalRelay } from '../../lib/terminal/relay.js'
+import { createShellManager } from '../../lib/terminal/manager.js'
 
 const BRIDGE_PATH = fileURLToPath(new URL('../../lib/terminal/bridge.cjs', import.meta.url))
 
@@ -131,6 +132,8 @@ test('terminal relay + real bridge + fixture SSH server', async (t) => {
     logger: QUIET_LOGGER,
     socketPath,
   })
+  /** @type {any} */
+  let shellManager
   /** @type {Array<ReturnType<typeof startBridge>>} */
   const bridges = []
   t.after(async () => {
@@ -142,6 +145,7 @@ test('terminal relay + real bridge + fixture SSH server', async (t) => {
       }
     }
     await Promise.allSettled(bridges.map((bridge) => bridge.exited))
+    await shellManager?.dispose()
     await relay.dispose()
     transport.dispose()
     await srv.close()
@@ -242,6 +246,45 @@ test('terminal relay + real bridge + fixture SSH server', async (t) => {
   await waitForStdout(bridgeOne, 'after-reconnect')
   await waitForStdout(bridgeTwo, 'after-reconnect')
 
+  // --- Agent tools borrow the exact PTY already shown in the native terminal ---
+  const shellConfig = makeConfig({
+    terminalIdleSilenceMs: 100,
+    terminalTimeoutMs: 5_000,
+    terminalStartupTimeoutMs: 2_000,
+    terminalScrollbackLines: 100,
+    terminalScrollbackBytes: 20_000,
+    terminalMaxReadBytes: 4_096,
+  })
+  shellManager = createShellManager({ transport, relay, config: shellConfig, logger: QUIET_LOGGER })
+  const agent = { id: 'agent-runtime-id', session: { id: 'int' } }
+  const shell = await shellManager.open({ agent, host })
+  assert.equal(shell.sharedTerminal, true)
+  assert.equal(srv.shellTotal, 2, 'Agent open must not allocate another SSH shell channel')
+  assert.equal(relay.list()[0].sharedWithAgent, true)
+
+  const agentSend = shellManager.send({ agent, sessionId: shell.sessionId, text: "printf 'agent-shared-ok\\n'" })
+  await waitForStdout(bridgeOne, 'agent-shared-ok')
+  const agentResult = await agentSend
+  assert.match(agentResult.viewport, /agent-shared-ok/u)
+
+  bridgeOne.write("printf 'human-shared-ok\\n'\r")
+  await waitForStdout(bridgeTwo, 'human-shared-ok')
+  await waitFor(() => shellManager.read({ agent, sessionId: shell.sessionId }).text.includes('human-shared-ok'), {
+    label: 'human command in Agent scrollback',
+  })
+
+  // The bridge's raw Ctrl-C byte is tested against the same acquired PTY in the
+  // fake-transport relay/manager test; this real fixture focuses on cross-layer
+  // shell/output identity without its pipe-backed line-discipline race.
+  assert.equal(srv.shellTotal, 2, 'human and Agent input continue in one SSH shell')
+
+  // Once an Agent owns the PTY, exit is reported rather than silently replaced.
+  bridgeOne.write('exit\r')
+  await waitFor(() => relay.list()[0]?.state === 'error', { label: 'shared PTY exit state' })
+  await waitFor(() => shellManager.describe(agent, shell.sessionId).status.kind === 'exited', { label: 'Agent sees shared PTY exit' })
+  await new Promise((resolve) => setTimeout(resolve, 250))
+  assert.equal(srv.shellTotal, 2, 'Agent-owned PTY exit must not auto-open a fresh shell')
+
   // --- clean bridge shutdown on SIGTERM ------------------------------------
   for (const bridge of bridges) bridge.child.kill('SIGTERM')
   await Promise.all(bridges.map((bridge) => bridge.exited))
@@ -251,4 +294,6 @@ test('terminal relay + real bridge + fixture SSH server', async (t) => {
   }
   await waitFor(() => relay.list()[0].attached === 0, { label: 'all bridges detached' })
   await waitFor(async () => (await readBridgeLog()).includes('exit code=0'), { label: 'bridge log exit' })
+  await shellManager.close({ agent, sessionId: shell.sessionId })
+  assert.deepEqual(relay.list(), [], 'Agent close releases the relay entry after native terminals detach')
 })

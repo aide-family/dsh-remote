@@ -12,7 +12,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export DSH_HOME="${DSH_DEV_HOME:-$REPO_DIR/.dsh-test}"
 PROFILE="${1:-${PROFILE:-remotedev}}"
-TARGET="$DSH_HOME/profiles/$PROFILE/node_modules/dsh-remote"
+TARGET="$DSH_HOME/profiles/$PROFILE/node_modules/@aide-family/dsh-remote"
 
 if [ ! -d "$DSH_HOME/profiles/$PROFILE" ]; then
   echo "profile $PROFILE missing; run scripts/dev-profile.sh first" >&2

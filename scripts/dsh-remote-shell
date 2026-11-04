@@ -8,7 +8,7 @@
 #   - id: terminal-controller
 #     config:
 #       shell:
-#         path: /Users/hubiao/aide-family/dsh-remote/scripts/dsh-remote-shell
+#         path: /path/to/dsh-remote/scripts/dsh-remote-shell
 #         name: Remote SSH
 #         args: []
 #

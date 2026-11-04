@@ -1,0 +1,58 @@
+name: Publish npm package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          package_version="$(node -p "require('./package.json').version")"
+          expected_tag="v${package_version}"
+          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package version ${package_version} (expected ${expected_tag})." >&2
+            exit 1
+          fi
+
+      - name: Run unit tests
+        run: npm run test:unit
+
+      - name: Run DSH-independent integration tests
+        run: >-
+          node --test
+          test/integration/live-stream.test.mjs
+          test/integration/management-api.test.mjs
+          test/integration/relay.test.mjs
+          test/integration/terminal-manager.test.mjs
+
+      - name: Verify package contents
+        run: npm pack --dry-run
+
+      - name: Publish to npm with provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance

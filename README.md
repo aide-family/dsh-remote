@@ -84,9 +84,9 @@ execution.
 ### From a local tarball (recommended for this checkout)
 
 ```sh
-cd /Users/hubiao/aide-family/dsh-remote
+cd /path/to/dsh-remote
 npm install                       # once: ssh2 + test devDependencies
-npm run install:profile           # packs dist/dsh-remote-<version>.tgz and installs
+npm run install:profile           # packs dist/aide-family-dsh-remote-<version>.tgz and installs
                                   # it into the "desktop" profile
 ```
 
@@ -94,7 +94,7 @@ Or do the steps manually and choose another profile:
 
 ```sh
 npm run pack:plugin
-dsh plugin --profile desktop add file:$PWD/dist/dsh-remote-0.5.2.tgz --ignore-scripts
+dsh plugin --profile desktop add file:$PWD/dist/aide-family-dsh-remote-0.5.3.tgz --ignore-scripts
 ```
 
 Then fully quit and reopen the DSH Desktop app (a newly installed bundle is
@@ -117,16 +117,16 @@ loaded on the next boot), or boot the CLI profile you installed into.
 ### From npm (when published)
 
 ```sh
-dsh plugin --profile desktop add dsh-remote --ignore-scripts
+dsh plugin --profile desktop add @aide-family/dsh-remote --ignore-scripts
 ```
 
 ### Where it lands
 
-The plugin is a DSH **bundle**: installing it adds the `dsh-remote` package and a
-`dsh-remote` row to the profile. To remove it:
+The plugin is a DSH **bundle**: installing it adds the `@aide-family/dsh-remote`
+package and a `dsh-remote` plugin row to the profile. To remove the package:
 
 ```sh
-dsh plugin --profile desktop remove dsh-remote
+dsh plugin --profile desktop remove @aide-family/dsh-remote
 ```
 
 ## Configure
@@ -176,6 +176,82 @@ Hosts from `~/.ssh/config` need no configuration at all. If `~/.ssh/config`
 contains `Host prod-*` patterns, those wildcard entries are skipped (a pattern
 is not a concrete target); add a concrete host block or a `hosts:` entry.
 
+### Cluster shortcuts with ordered terminal actions
+
+The host manager can save a **cluster shortcut** through an existing SSH entry
+(for example `bastion-demo`). Replace the former fixed login command with an ordered
+**action list**: add/remove/reorder actions, select each type, and configure its
+completion condition and timeout. The same `actions` field works in plugin `hosts`
+configuration:
+
+```json
+{
+  "name": "cluster-a",
+  "viaHost": "bastion-demo",
+  "actions": [
+    { "type": "command", "value": "sww -r -u demo.user cluster-a", "expectCluster": "cluster-a" },
+    { "type": "command", "value": "cd /tmp" }
+  ],
+  "tags": ["cluster", "cluster-a"],
+  "description": "cluster-a cluster through bastion-demo"
+}
+```
+
+After entrance SSH authentication, actions run sequentially in the **same shared
+PTY** used by the human and Agent. A new ordinary-shell sequence waits for the
+entry prompt before sending. For a menu or custom entrance prompt, put a literal
+`wait` action first: that output becomes the readiness barrier instead of a generic
+Shell prompt. Connection readiness means all configured action completion
+conditions were met, not merely that a terminal tab opened.
+
+| Type | Input | Completion |
+| --- | --- | --- |
+| `command` | Printable single-line `value`, automatically followed by Enter | Shell prompt by default; optional literal `expect`, or `expectCluster` for a root prompt on that cluster |
+| `text` | Printable `value`, no Enter appended | Input issuance, or optional literal `expect` |
+| `key` | `Enter`, `Tab`, `Escape`, `Ctrl-C`, `Ctrl-D`, arrow keys, or `Backspace` | Input issuance, or optional literal `expect` |
+| `wait` | Literal output `value`, not a regular expression | That unconsumed output is observed |
+| `delay` | `durationMs` | Cancellable timer completes |
+
+Example menu interaction: `wait` for `Select cluster:` → `text` with `1` → `key`
+`Enter` → `wait` for the target's success message. Text/key issuance alone does
+not prove an interaction completed. A Shell prompt does **not** prove exit code 0
+or the intended target was reached; for a login/target change, configure explicit
+target-success output or the target-cluster root check.
+
+Since 0.6.1, default completion accepts mode-prefixed user@host prompts such as
+`[ K8S-RONLY ]root@web1.region-a.example.test:~#`, including streamed ANSI output.
+The explicit `expectCluster` check still matches the actual root hostname's domain
+segment, not a Kubernetes context name: a logical `cluster-b` context may use a
+`.region-a` pod hostname. In that case use observed literal `expect` output rather than
+requiring a nonexistent `.cluster-b` hostname. Mode labels alone do not mark ready;
+matching a prompt does not grant write permission or override read-only policy.
+
+There may be 1–32 actions, each optionally labelled. Send text is bounded to 4096
+characters with no control characters; waits are bounded to 2048 characters.
+`timeoutMs` defaults to 30000, range 100–120000. Delays are 0–120000 ms and the
+whole sequence is capped at 20 minutes. Progress exposes counts/type/label only,
+not raw action input or output. **Do not embed passwords, tokens or private keys
+in actions**; entrance authentication uses the secure user-only dialog or existing
+credential references.
+
+A timeout, cancellation, PTY exit or execution error stops the sequence without
+sending remaining actions. Observing a completion condition is not a command
+exit-code check. Reattaching/adopting an initialized PTY does not replay actions;
+user-terminal reconnects initialize the genuinely new channel once. Agent-owned
+PTYs keep the no-silent-reconnect rule. Legacy `viaHost` + `loginCommand` records
+are automatically migrated into one command action while retaining the original
+root-on-target confirmation; saving the editor uses `actions` only.
+
+Shortcuts inherit entrance SSH settings, `allowHosts` and read-only restrictions;
+missing entrances, self-reference, cycles and multi-level shortcuts still fail.
+They remain **terminal-only**: select the shortcut in Remote Ops or use
+`remote_shell_open`, then reuse its session id with `remote_shell_send/read/signal`.
+Exec, probe and SFTP would target the entrance and remain disabled. Every automatic
+send respects command risk and deny patterns; no saved action grants approval.
+Strict policies (`always`, `never`, `unprovenCommands: ask`), read-only unproven
+inputs or a high-risk send requiring unavailable approval fail explicitly. Use the
+ordinary entrance terminal and the normal approved manual flow in those cases.
+
 ### Authentication
 
 The transport tries, in order, and uses the first that applies:
@@ -185,6 +261,21 @@ The transport tries, in order, and uses the first that applies:
    an optional passphrase from `passphraseEnv`.
 3. `ssh-agent` (`SSH_AUTH_SOCK`).
 4. Default keys: `~/.ssh/id_ed25519`, `~/.ssh/id_ecdsa`, `~/.ssh/id_rsa`.
+
+For an interactive terminal connection that fails with `AUTH`, the UI now opens
+a masked **SSH 密码登录** dialog. A successful fixed password is retained only in
+Host process memory for that exact host/port/user until plugin disposal or app
+restart; it is never saved to the host registry, sent to the Agent, or recorded
+in audit/debug logs. Failed passwords are not cached or automatically retried.
+The browser uses the existing authenticated Host/Origin-fenced API.
+
+Password auth also supports a single non-echoing `Password:` keyboard-interactive
+challenge. OTP/MFA prompts, multiple prompts, echoing prompts, repeated rounds,
+and interactive password login through ProxyJump are not supported; a fixed
+password is never automatically supplied to those challenges. The parser honors
+`PubkeyAuthentication`, `PasswordAuthentication`, and
+`KbdInteractiveAuthentication` for concrete SSH Host blocks. In particular,
+`PubkeyAuthentication no` prevents fallback to default private keys.
 
 Secrets are never read from YAML, never logged, and never included in tool
 results or approval prompts.
@@ -289,27 +380,39 @@ How it works:
 2. The plugin opens a native terminal tab in the right sidebar of that
    conversation. A small local bridge (`bin/dsh-remote-terminal` →
    `lib/terminal/bridge.cjs`) connects to the Host's terminal relay over a
-   user-only local socket; the relay owns the SSH PTY (`transport.openPty`).
+   user-only local socket; the relay in the DSH Host process owns the SSH PTY
+    (`transport.openPty`). This is an interactive SSH shell in DSH's native
+    terminal, **not a local
+    `ssh` process**. The browser plugin cannot spawn OS processes; it writes one
+    quoted bridge-launch line via DSH's terminal-view API and verifies the relay
+    attachment.
    Everything you type reaches the remote shell, and its output (ANSI included)
    renders in xterm. If the tab or the bridge cannot be established, the panel
    says so, shows the exact command with **复制命令**, and points at
    `$DSH_HOME/remote/terminal-bridge.log` — paste the command into any local
    terminal to connect manually.
-3. **One SSH session per conversation + host.** Re-opening the terminal for the
-   same host reattaches the same relay session instead of dialing again; closing
-   the terminal tab leaves the session alive for `userTerminalTtlMs` so a re-open
-   continues where you were. The pooled SSH connection is shared with the
-   agent's tools for the same host.
-4. **Auto-recovery.** If the SSH channel drops, the relay reconnects with
-   backoff (1s/2s/4s/8s/16s/30s, up to `userTerminalReconnectAttempts`) and
-   prints a banner in the terminal; the bridge itself also retries when the DSH
-   Host restarts. Nothing to re-type.
+3. **The Agent and human share the exact PTY.** The relay's canonical key is
+   `(DSH conversation id, host)`. When `remote_shell_open` runs in that
+   conversation, the Agent shell manager borrows that relay PTY rather than
+   opening another SSH shell channel; opens are reused per Agent + host. Reopening
+   the native terminal attaches to the same relay session. Closing its tab does
+   not idle-close an Agent-owned PTY; `remote_shell_close`, Agent disposal, or
+   plugin shutdown closes the shared session.
+4. **Recovery is state-aware.** A terminal-only relay can reconnect with backoff
+   (1s/2s/4s/8s/16s/30s, up to `userTerminalReconnectAttempts`) and the bridge
+   retries when the DSH Host restarts. If an Agent owns the PTY and its SSH
+   channel exits, the relay marks that shared shell ended instead of reconnecting
+   to a fresh shell that would falsely appear to preserve state; explicitly open
+   a new session to continue.
 
-**The terminal must actually be connected.** Opening a tab is not proof: the
-panel verifies that the local bridge reached the relay (`attached >= 1`,
-`bytesIn > 0`), retries the typed launch command while the shell is still
-starting, and if it still fails shows the exact command with a **复制命令**
-button plus the path of `$DSH_HOME/remote/terminal-bridge.log`. The shell line
+**The terminal must actually be connected.** Opening a tab is not proof: after
+writing the local bridge launch line once, the panel waits for a *new* bridge
+attach beyond the session's pre-launch counter and requires the relay SSH state
+to be `connected`. It never replays the launch line automatically: if the first
+write was delayed, replaying it could reach an already-connected remote shell as
+user input. On failure it does not claim success; it shows the exact command
+with a **复制命令** button plus the path of
+`$DSH_HOME/remote/terminal-bridge.log`. The shell line
 does not depend on the terminal's `PATH`: it uses the Host's own node binary
 (directly, through `ELECTRON_RUN_AS_NODE` in the Desktop app, or the bundled
 runtime node) and falls back to the packaged launcher. The panel also shows the
@@ -320,10 +423,14 @@ events, so a session that opened but never attached is visible in the host's
 audit history.
 
 Limits: the relay keeps a bounded replay buffer (`userTerminalScrollbackBytes`,
-default 400 KB) so a reattached terminal shows recent output; a full-screen TUI
-is supported (it is a real PTY), but the agent still cannot use one through
-`remote_shell_*`. Terminal sessions are process-local: a harness restart ends
-them, and the terminal reconnects into a fresh shell on demand.
+default 400 KB) so a reattached terminal shows recent output. The native terminal
+is a full PTY and supports TUI interaction; Agent `remote_shell_read` returns
+ANSI-sanitized line text, so the Agent should use it for shell state and rely on
+the native terminal for full-screen rendering. Agent-submitted lines retain the
+normal risk/approval checks. Human keystrokes are explicit operator actions and
+are never copied into the audit trail (they may contain passwords). Terminal
+sessions are process-local: a harness restart ends the remote process shell; do
+not infer that a new shell has the old state.
 
 The old host-picker shell (`scripts/dsh-remote-shell`, an `ssh -t` session
 configured through `terminal-controller`'s `shell` profile) still exists as a
@@ -334,8 +441,6 @@ standalone fallback, but it is not used by the panel.
 Every `remote_exec` command and submitted `remote_shell_send` line is mirrored
 into a right-sidebar tab, so you watch the real execution instead of only the
 final tool card:
-
-![Remote Terminal panel](docs/assets/remote-terminal.png)
 
 - **Opens automatically** on the first remote command of the session (the
   right-sidebar column expands), and is also available from the right sidebar's
@@ -368,12 +473,10 @@ read-only commands run).
 
 The plugin registers a first-level sidebar panel in the DSH Web/Desktop GUI:
 
-![Remote Ops management page](docs/assets/management-page.png)
-
 | Section | What you get |
 | --- | --- |
-| Remote hosts | Every discovered host (source, `user@host:port`, auth hint, readonly / allowHosts policy) with a per-row **测试连接 / Test connection** that runs one read-only probe (connect + `uname -srm; hostname`) and shows latency and output inline. |
-| Host actions | Each row has an 操作 column: **连接** (quick connect: create the SSH session, open the native terminal, hand the host to the agent in the current conversation), **审计** (that host's command/terminal-session history), **编辑** / **删除** for managed hosts. **添加主机** opens the connection form. |
+| Connection rail + host workbench | The connection rail selects a discovered host; the workbench shows source, `user@host:port`, auth hint, readonly / allowHosts policy, connectivity, terminal and Agent-session state, and the selected host's actions. |
+| Host actions | **测试连接 / Test connection** runs a read-only probe (connect + `uname -srm; hostname`) and shows latency/output; **连接** creates a conversation, opens its native terminal, and hands the host to the Agent using the same conversation-host PTY; **审计**, **编辑** / **删除** for managed hosts. **添加主机** opens the connection form. |
 | Remote shell sessions | Live `remote_shell_*` sessions for every agent (session id, host, status) with a bounded scrollback preview and a **结束会话 / Close** action. |
 | Recent operations | The newest **20** audit entries: time, tool, host, action, risk level (low/gray/high/write), outcome (ok / denied / error), duration, and the command/path, with a JSON/CSV/TXT export of the full retained trail. |
 
@@ -413,12 +516,15 @@ config if you do not want the route registered.
 
 ## Safety model
 
-- **Static review before approval.** Every `remote_exec` command is classified
-  by the ported Crescent classifier. Under `policy: auto` only `high` (provably
-  mutating) commands need approval; `low` and `gray` (unproven) run directly,
-  with the live terminal and audit trail recording them. `unprovenCommands: ask`
-  restores approval for the unproven class, and `remote_write` / `remote_edit` /
-  `remote_transfer` always need approval.
+- **Static review before approval.** Every `remote_exec` command and submitted
+  `remote_shell_send` line is classified by the ported Crescent classifier.
+  Under `policy: auto` only `high` (provably mutating) commands need approval;
+  `low` and `gray` (unproven) run directly, with the live terminal and audit
+  trail recording Agent actions. Direct keystrokes in the native terminal are
+  explicit human operator actions: they bypass Agent approval and are not stored
+  in audit payloads. `unprovenCommands: ask` restores approval for the unproven
+  class, and `remote_write` / `remote_edit` / `remote_transfer` always need
+  approval.
 - **Fail closed.** No approval answerer mounted, a cancelled prompt, a rejected
   prompt, or an approval-service failure all deny the action.
 - **`policy: never`** is the headless/unattended stance: statically read-only
@@ -452,6 +558,28 @@ the desktop app (symlinked, never copied). It asserts the real harness loads the
 plugin, registers the tools, and executes read-only remote actions; mutating
 actions are asserted to fail closed in headless mode.
 
+## Automated npm publishing
+
+The npm package name is `@aide-family/dsh-remote`; the DSH plugin row id remains
+`dsh-remote`. Before enabling releases, add a repository Actions secret named
+`NPM_TOKEN` with publish permission for the `@aide-family` scope. Do not put the
+token in the repository or a checked-in `.npmrc`.
+
+Pushing a tag that exactly matches the manifest version (for example, `v0.5.3`)
+starts the [publish workflow](https://github.com/aide-family/dsh-remote/blob/main/.github/workflows/publish-npm.yml).
+The workflow installs from the lockfile, runs unit tests plus the DSH-independent
+integration suites, checks the tag/package version match, previews the tarball,
+then publishes publicly with provenance.
+The publisher must have rights to create packages in the `@aide-family` scope.
+
+```sh
+git tag v0.5.3
+git push origin v0.5.3
+```
+
+Published versions cannot be reused. If a release has a mistake, fix it and
+publish a higher version; do not try to overwrite the existing version.
+
 ## Known limitations
 
 - **No persistent remote shell.** `remote_exec` is one-shot (no PTY): each call
@@ -464,10 +592,11 @@ actions are asserted to fail closed in headless mode.
 - **Workspace containment is lexical.** Transfer local paths are checked
   lexically against the session working directory (no symlink resolution);
   keep `allowLocalOutsideWorkspace: false` unless you need otherwise.
-- **GUI host management is limited to env-var auth.** The form stores connection
-  metadata only (`~/.ssh/config`/plugin-config hosts stay authoritative for their
-  own entries); passwords and key passphrases are environment-variable names, so
-  a managed host still needs that variable exported to the DSH process.
+- **Saved host authentication contains references only.** The host form stores
+  metadata and environment-variable names, never raw passwords. Interactive
+  terminal connections can request a fixed password in the masked login dialog,
+  retained only in Host memory; encrypted-key passphrases still use environment
+  references. A restart requires entering a transient password again.
 - **One connection per host.** Operations for one host are serialized through a
   single pooled SSH connection (plus ProxyJump hops), so concurrent calls to the
   same host queue rather than open many sessions.
@@ -528,6 +657,20 @@ Attribution: the command-risk classifier in `lib/policy/` is ported from the
 Crescent project (`aide-family/Crescent`, `src/shared/command-guard.ts`,
 `src/shared/shell-command.ts`, `src/shared/command-policy/`).
 
+## Repository privacy
+
+Source, tests, examples, documentation and published assets must not contain
+private organization names, personal identifiers or real test connection details.
+Use synthetic cluster/host aliases and accounts, reserved example domains such as
+`example.test`, and documentation IP ranges (`192.0.2.0/24`, `198.51.100.0/24`,
+`203.0.113.0/24`). Keep loopback addresses for local fixture servers. Use generic
+paths instead of a developer's home directory.
+
+Browser captures must disable SSH-config discovery (`includeSshConfig: false`),
+use isolated fixture inventory, and show synthetic command output rather than
+local usernames or machine details. Review images, logs, archives and package
+contents before publication; never commit live connection records or secrets.
+
 ## Verification
 
 ```sh
@@ -541,7 +684,8 @@ that read-only remote actions work, that mutating actions fail closed in headles
 mode, that a persistent PTY shell opens, echoes a command, and closes cleanly,
 and that an unproven (gray) command now runs without approval. The management page is verified in a real browser against an isolated
 DSH Web profile (`npm run dev:web` boots it, drives it with headless Chrome, and
-writes a screenshot); the checked-in screenshots above were produced that way.
+writes a local screenshot). Historical screenshots were removed because they
+contained real connection details; do not publish unreviewed browser captures.
 `--emit-live` verifies the v0.4 live mirror (guide entry, auto-open, streamed
 commands/output, session and host filters, scrolling, Clear). `--remote-terminal`
 boots the same profile with a real SSH fixture host and verifies v0.5 end to end:
@@ -550,8 +694,8 @@ terminal, typing a command into the xterm, the `已连接远程主机 …` conve
 handoff, the per-host audit modal, the host-manager add/delete round-trip, and
 per-conversation session reuse (same sessionKey on a second open) — with zero
 browser console errors. `--docs-shots` additionally captures
-`docs/assets/remote-terminal.png` from a clean panel-driven terminal (no agent
-handoff). The v0.5.1 pass additionally asserts the relay `attached`/`attachCount`
+a local terminal screenshot from a fixture-only panel with synthetic output (no
+agent handoff). Review captures for private data before publishing them. The v0.5.1 pass additionally asserts the relay `attached`/`attachCount`
 /`bytesIn` counters (the local bridge really reached the SSH session), the
 per-host audit `attach` event, one-click full-detail expansion, a real JSON
 export download with `detailFull`, and that `overview.audit` returns at most the
@@ -562,7 +706,7 @@ install is verified separately:
 
 ```sh
 npm run pack:plugin
-dsh plugin --profile <test-profile> add file:$PWD/dist/dsh-remote-<version>.tgz --ignore-scripts
+dsh plugin --profile <test-profile> add file:$PWD/dist/aide-family-dsh-remote-<version>.tgz --ignore-scripts
 E2E_SKIP_SYNC=1 DSH_TEST_PROFILE=<test-profile> node scripts/e2e.mjs
 ```
 
