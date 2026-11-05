@@ -373,11 +373,22 @@ test('exec: AbortSignal rejects with AbortError and closes the channel', async (
 
   const controller = new AbortController()
   const startedAt = Date.now()
-  setTimeout(() => controller.abort(), 100)
-  await assert.rejects(
-    transport.exec(host, { command: 'sleep 5', signal: controller.signal, timeoutMs: 10_000 }),
-    (error) => error instanceof Error && error.name === 'AbortError',
+  const execution = transport.exec(host, {
+    command: 'sleep 5',
+    signal: controller.signal,
+    timeoutMs: 10_000,
+  })
+  // Abort only after the fixture has seen the exec request. Aborting on a fixed
+  // delay races the SSH handshake, which is slow enough on some runners for the
+  // abort to land during connect — that exercises the connect path instead of
+  // the in-channel abort path this test is about.
+  assert.equal(
+    await waitFor(() => srv.execCommands.includes('sleep 5')),
+    true,
+    'fixture never received the exec request',
   )
+  controller.abort()
+  await assert.rejects(execution, (error) => error instanceof Error && error.name === 'AbortError')
   assert.ok(Date.now() - startedAt < 3_000)
 
   // Channels/connection still usable after the abort.
