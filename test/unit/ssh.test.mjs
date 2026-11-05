@@ -14,6 +14,7 @@ import ssh2 from 'ssh2'
 
 import { startSshServer } from '../fixtures/ssh-server.mjs'
 import { createSshTransport } from '../../lib/ssh/transport.js'
+import { runExec } from '../../lib/ssh/exec.js'
 import { isChannelFailure, RemoteFsError, SshError } from '../../lib/ssh/errors.js'
 import { resolveAuth, DEFAULT_KEY_NAMES } from '../../lib/ssh/auth.js'
 import { knownHostId } from '../../lib/ssh/known-hosts.js'
@@ -391,6 +392,57 @@ test('exec: AbortSignal rejects with AbortError and closes the channel', async (
     transport.exec(host, { command: 'printf never', signal: preAborted.signal }),
     (error) => error instanceof Error && error.name === 'AbortError',
   )
+})
+
+/**
+ * Fake ssh2 client whose channel emits `close` synchronously from its own
+ * teardown and never reports an exit status: the shape that races with the
+ * abort/timeout settlement path. No server, so the race is deterministic.
+ */
+function teardownClosingClient() {
+  return {
+    exec(_command, callback) {
+      /** @type {null | (() => void)} */
+      let onClose = null
+      const channel = {
+        stderr: { on() {} },
+        on(event, listener) {
+          if (event === 'close') onClose = listener
+          return this
+        },
+        signal() {},
+        close() {
+          onClose?.()
+        },
+        destroy() {},
+      }
+      callback(null, channel)
+    },
+  }
+}
+
+test('exec: teardown close during an abort is not a channel failure', async () => {
+  const controller = new AbortController()
+  const promise = runExec(teardownClosingClient(), 'sleep 5', {
+    signal: controller.signal,
+    timeoutMs: 10_000,
+  })
+  controller.abort()
+  await assert.rejects(promise, (error) => {
+    assert.equal(error.name, 'AbortError')
+    assert.equal(
+      isChannelFailure(error),
+      false,
+      'an abort must never look like a retryable channel failure',
+    )
+    return true
+  })
+})
+
+test('exec: teardown close on timeout still resolves with timedOut', async () => {
+  const result = await runExec(teardownClosingClient(), 'sleep 5', { timeoutMs: 20 })
+  assert.equal(result.timedOut, true)
+  assert.equal(result.code, -1)
 })
 
 test('exec: maxBytes keeps the tail of each stream and flags truncation', async (t) => {
