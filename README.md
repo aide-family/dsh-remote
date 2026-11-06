@@ -113,27 +113,27 @@ command output. No real host, account, key, or local path is shown.
 **Remote Ops management page.** Host inventory, per-host detail, live shell
 sessions, and the recent-operation audit trail in one panel.
 
-![Remote Ops management page](docs/assets/remote-ops.png)
+![Remote Ops management page](https://cdn.jsdelivr.net/gh/aide-family/dsh-remote@main/docs/assets/remote-ops.png)
 
 **Live terminal mirror.** Every agent command streams into the conversation's
 right sidebar; the same panel opens DSH's native terminal on a chosen host.
 
-![Live terminal mirror](docs/assets/live-terminal.png)
+![Live terminal mirror](https://cdn.jsdelivr.net/gh/aide-family/dsh-remote@main/docs/assets/live-terminal.png)
 
 **Host manager.** Add, edit, or remove managed connections. Secrets stay as
 environment-variable names or key paths.
 
-![Host manager](docs/assets/host-manager.png)
+![Host manager](https://cdn.jsdelivr.net/gh/aide-family/dsh-remote@main/docs/assets/host-manager.png)
 
 **Per-host audit.** Filter by host, expand the full command, or export
 JSON/CSV/TXT.
 
-![Per-host audit](docs/assets/host-audit.png)
+![Per-host audit](https://cdn.jsdelivr.net/gh/aide-family/dsh-remote@main/docs/assets/host-audit.png)
 
 **Native remote terminal.** A real xterm attached to the per-conversation SSH
 session; close and re-open the tab to reattach it.
 
-![Native remote terminal](docs/assets/remote-terminal.png)
+![Native remote terminal](https://cdn.jsdelivr.net/gh/aide-family/dsh-remote@main/docs/assets/remote-terminal.png)
 
 ## Features
 
