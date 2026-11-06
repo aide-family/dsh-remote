@@ -57,7 +57,7 @@ Or pack and install manually into another profile:
 
 ```sh
 npm run pack:plugin
-dsh plugin --profile desktop add file:$PWD/dist/aide-family-dsh-remote-0.6.1.tgz --ignore-scripts
+dsh plugin --profile desktop add file:$PWD/dist/aide-family-dsh-remote-0.6.2.tgz --ignore-scripts
 ```
 
 Install into the profile you actually boot: `desktop` for the Desktop app, or
@@ -113,27 +113,27 @@ command output. No real host, account, key, or local path is shown.
 **Remote Ops management page.** Host inventory, per-host detail, live shell
 sessions, and the recent-operation audit trail in one panel.
 
-![Remote Ops management page](https://cdn.jsdelivr.net/gh/aide-family/dsh-remote@main/docs/assets/remote-ops.png)
+![Remote Ops management page](https://cdn.jsdelivr.net/gh/aide-family/dsh-remote@v0.6.2/docs/assets/remote-ops.png)
 
 **Live terminal mirror.** Every agent command streams into the conversation's
 right sidebar; the same panel opens DSH's native terminal on a chosen host.
 
-![Live terminal mirror](https://cdn.jsdelivr.net/gh/aide-family/dsh-remote@main/docs/assets/live-terminal.png)
+![Live terminal mirror](https://cdn.jsdelivr.net/gh/aide-family/dsh-remote@v0.6.2/docs/assets/live-terminal.png)
 
 **Host manager.** Add, edit, or remove managed connections. Secrets stay as
 environment-variable names or key paths.
 
-![Host manager](https://cdn.jsdelivr.net/gh/aide-family/dsh-remote@main/docs/assets/host-manager.png)
+![Host manager](https://cdn.jsdelivr.net/gh/aide-family/dsh-remote@v0.6.2/docs/assets/host-manager.png)
 
 **Per-host audit.** Filter by host, expand the full command, or export
 JSON/CSV/TXT.
 
-![Per-host audit](https://cdn.jsdelivr.net/gh/aide-family/dsh-remote@main/docs/assets/host-audit.png)
+![Per-host audit](https://cdn.jsdelivr.net/gh/aide-family/dsh-remote@v0.6.2/docs/assets/host-audit.png)
 
 **Native remote terminal.** A real xterm attached to the per-conversation SSH
 session; close and re-open the tab to reattach it.
 
-![Native remote terminal](https://cdn.jsdelivr.net/gh/aide-family/dsh-remote@main/docs/assets/remote-terminal.png)
+![Native remote terminal](https://cdn.jsdelivr.net/gh/aide-family/dsh-remote@v0.6.2/docs/assets/remote-terminal.png)
 
 ## Features
 
@@ -628,7 +628,7 @@ The npm package name is `@aide-family/dsh-remote`; the DSH plugin row id remains
 `NPM_TOKEN` with publish permission for the `@aide-family` scope. Do not put the
 token in the repository or a checked-in `.npmrc`.
 
-Pushing a tag that exactly matches the manifest version (for example, `v0.6.1`)
+Pushing a tag that exactly matches the manifest version (for example, `v0.6.2`)
 starts the [publish workflow](https://github.com/aide-family/dsh-remote/blob/main/.github/workflows/publish-npm.yml).
 The workflow installs from the lockfile, runs unit tests plus the DSH-independent
 integration suites, checks the tag/package version match, previews the tarball,
@@ -636,8 +636,8 @@ then publishes publicly with provenance.
 The publisher must have rights to create packages in the `@aide-family` scope.
 
 ```sh
-git tag v0.6.1
-git push origin v0.6.1
+git tag v0.6.2
+git push origin v0.6.2
 ```
 
 Published versions cannot be reused. If a release has a mistake, fix it and
