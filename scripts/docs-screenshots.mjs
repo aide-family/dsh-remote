@@ -86,11 +86,10 @@ const LIVE_EMITS = [
 
 /** Strings that must never appear in a published capture. */
 const PRIVATE_PATTERNS = [
-  { label: "real LAN address", re: /\b(?:10|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/u },
+  { label: "real LAN address", re: /\b(?:10(?:\.\d{1,3}){3}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})\b/u },
   { label: "private SSH inventory address", re: /192\.168\.\d{1,3}\.\d{1,3}/u },
-  { label: "developer home path", re: /\/Users\/hubiao/u },
-  { label: "account name", re: /梧桐/u },
-  { label: "real host alias", re: /proxy\.aide-cloud\.cn|aide-cloud/iu },
+  { label: "local home path", re: /(?:\/Users\/|\/home\/)[^\s/]+/u },
+  { label: "local Windows profile path", re: /[A-Z]:\\Users\\[^\s\\]+/iu },
 ];
 
 async function exists(path) {

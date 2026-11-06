@@ -12,13 +12,14 @@ class Pty {
   status() { return { kind: this.closed ? "exited" : "running" }; }
 }
 
-test("auto login respects validation, deny patterns, readonly and strict policies", async () => {
+test("configured login skips Agent approval modes but respects validation and hard denials", async () => {
   assert.equal(await authorizeConnectionLogin({ name: "normal" }), null);
   assert.deepEqual(await authorizeConnectionLogin(host, { config: { policy: "auto" } }), { viaHost: "bastion-demo", actions: [{ type: "command", value: host.loginCommand, expectCluster: "cluster-a" }] });
   await assert.rejects(authorizeConnectionLogin({ ...host, loginCommand: "sww -r -u user cluster-a; reboot" }), { code: "HOST_INVALID" });
-  for (const config of [{ policy: "never" }, { policy: "always" }, { policy: "auto", unprovenCommands: "ask" }, { policy: "auto", denyCommandPatterns: ["sww"] }]) {
-    await assert.rejects(authorizeConnectionLogin(host, { config }), { code: "LOGIN_DENIED" });
+  for (const config of [{ policy: "never" }, { policy: "always" }, { policy: "auto", unprovenCommands: "ask" }]) {
+    assert.ok(await authorizeConnectionLogin(host, { config }));
   }
+  await assert.rejects(authorizeConnectionLogin(host, { config: { policy: "auto", denyCommandPatterns: ["sww"] } }), { code: "LOGIN_DENIED" });
   await assert.rejects(authorizeConnectionLogin(host, { config: { policy: "auto" }, hosts: { isReadonly: () => true } }), { code: "LOGIN_DENIED" });
 });
 

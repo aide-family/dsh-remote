@@ -955,9 +955,29 @@ test('relay: cluster login runs once, is confirmed, and Agent adoption does not 
   assert.equal(audit.entries.filter(e => e.tool === 'terminal.login').length, 2)
 })
 
+test('relay: configured sudo initializes once and reattach shares the same PTY without approval', async (t) => {
+  const shortcut = makeHost('entry-root-demo', { viaHost: 'entry-demo', actions: [{ type: 'command', value: 'sudo su - root' }] })
+  const transport = makeTransport()
+  const openPty = transport.openPty
+  transport.openPty = async (...args) => {
+    const pty = await openPty(...args)
+    pty.write = text => { pty.writes.push(text); pty.emit('root@entry:~# ') }
+    setImmediate(() => pty.emit('ops@entry:~$ '))
+    return pty
+  }
+  const { relay } = await makeRelay(t, { transport, hosts: [shortcut], config: { policy: 'always', unprovenCommands: 'ask' } })
+  const first = await relay.open({ hostName: 'entry-root-demo', sessionId: 'sudo-session' })
+  const again = await relay.open({ hostName: 'entry-root-demo', sessionId: 'sudo-session' })
+  await relay.acquireAgentPty({ hostName: 'entry-root-demo', sessionId: 'sudo-session' })
+  assert.equal(first.session.loginState, 'confirmed')
+  assert.equal(again.session.sessionKey, first.session.sessionKey)
+  assert.equal(transport.opens.length, 1)
+  assert.deepEqual(transport.ptys[0].writes, ['sudo su - root\r'])
+})
+
 test('relay: blocked automatic login does not open an entry SSH channel', async (t) => {
   const shortcut = makeHost('cluster-a', { viaHost: 'bastion-demo', loginCommand: 'sww -r -u demo.user cluster-a' })
-  const { relay, transport } = await makeRelay(t, { hosts: [shortcut], config: { policy: 'never' } })
+  const { relay, transport } = await makeRelay(t, { hosts: [shortcut], config: { policy: 'never', denyCommandPatterns: ['sww'] } })
   await assert.rejects(relay.open({ hostName: 'cluster-a', sessionId: 'conv-denied' }), /Connection action 1\/1 \(command\): Denied by the connection action policy/)
   assert.equal(transport.opens.length, 0)
   assert.equal(relay.list().length, 0)

@@ -309,11 +309,14 @@ Shortcuts inherit entrance SSH settings, `allowHosts` and read-only restrictions
 missing entrances, self-reference, cycles and multi-level shortcuts still fail.
 They remain **terminal-only**: select the shortcut in Remote Ops or use
 `remote_shell_open`, then reuse its session id with `remote_shell_send/read/signal`.
-Exec, probe and SFTP would target the entrance and remain disabled. Every automatic
-send respects command risk and deny patterns; no saved action grants approval.
-Strict policies (`always`, `never`, `unprovenCommands: ask`), read-only unproven
-inputs or a high-risk send requiring unavailable approval fail explicitly. Use the
-ordinary entrance terminal and the normal approved manual flow in those cases.
+Exec, probe and SFTP would target the entrance and remain disabled. Saved connection
+actions are **operator-trusted initialization**, not Agent commands: they run without
+approval regardless of `policy` / `unprovenCommands`, including `sudo su - root`.
+Only save actions you intend to execute whenever a genuinely new SSH PTY is opened.
+`denyCommandPatterns`, `allowHosts`, and inherited read-only restrictions still apply;
+read-only hosts reject mutating or unproven input. Agent-submitted commands after
+initialization continue through the normal risk review and approval gate.
+Reattaching the same PTY never repeats initialization.
 
 ### Authentication
 

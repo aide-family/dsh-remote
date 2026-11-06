@@ -97,9 +97,10 @@ test("first wait allows a menu entrance and navigation under unproven allow", as
   pty.emit("Choose target");
   await pending;
   assert.deepEqual(pty.writes, ["\x1b[B", "\r"]);
-  for (const options of [{ config: { policy: "auto", unprovenCommands: "ask" } }, { config: { policy: "never" } }, { hosts: { isReadonly: () => true } }]) {
-    await assert.rejects(authorizeConnectionLogin(profileOf(actions), options), { code: "LOGIN_DENIED" });
+  for (const config of [{ policy: "auto", unprovenCommands: "ask" }, { policy: "always" }, { policy: "never" }]) {
+    assert.ok(await authorizeConnectionLogin(profileOf(actions), { config }));
   }
+  await assert.rejects(authorizeConnectionLogin(profileOf(actions), { hosts: { isReadonly: () => true } }), { code: "LOGIN_DENIED" });
 });
 
 test("default command cannot reuse an earlier prompt", async () => {
@@ -124,14 +125,14 @@ test("literal matching strips streaming ANSI and never interprets regex", async 
   await assert.rejects(run(pty, [{ type: "text", value: "x", expect: "ready.*", timeoutMs: 100 }]), { code: "LOGIN_TIMEOUT" });
 });
 
-test("known high risk and split text submit deny before any writes", async () => {
+test("read-only hosts reject high risk and split text before any writes", async () => {
   for (const actions of [
     [{ type: "command", value: "reboot" }],
     [{ type: "text", value: "re" }, { type: "text", value: "boot" }, { type: "key", value: "Enter" }],
     [{ type: "key", value: "ArrowDown" }, { type: "command", value: "rm -rf /tmp/x" }],
   ]) {
     const pty = new Pty();
-    await assert.rejects(run(pty, actions), { code: "LOGIN_DENIED" });
+    await assert.rejects(runConnectionLogin(pty, { profile: { ...profileOf(actions), readonly: true }, initialOutput: entry }), { code: "LOGIN_DENIED" });
     assert.deepEqual(pty.writes, []);
   }
   const profile = await authorizeConnectionLogin(profileOf([{ type: "text", value: "safe" }]), { config: { policy: "auto", denyCommandPatterns: ["forbidden"] } });
@@ -139,6 +140,27 @@ test("known high risk and split text submit deny before any writes", async () =>
   const pty = new Pty();
   await assert.rejects(runConnectionLogin(pty, { profile, initialOutput: entry }), { code: "LOGIN_DENIED" });
   assert.deepEqual(pty.writes, []);
+});
+
+test("configured sudo root initialization runs once without Agent approval in every mode", async () => {
+  for (const config of [{ policy: "auto" }, { policy: "always" }, { policy: "never" }, { policy: "auto", unprovenCommands: "ask" }]) {
+    const pty = new Pty();
+    pty.respond = () => pty.emit("root@entry:~# ");
+    const profile = await authorizeConnectionLogin(profileOf([{ type: "command", value: "sudo su - root" }]), { config });
+    await runConnectionLogin(pty, { profile, initialOutput: entry });
+    assert.deepEqual(pty.writes, ["sudo su - root\r"]);
+    assert.equal(pty.data.size, 0);
+  }
+});
+
+test("trusted configuration still revalidates deny patterns and read-only status before sends", async () => {
+  const host = { ...profileOf([{ type: "command", value: "sudo su - root" }]), readonly: false };
+  const profile = await authorizeConnectionLogin(host, { config: { policy: "always" } });
+  host.readonly = true;
+  const pty = new Pty();
+  await assert.rejects(runConnectionLogin(pty, { profile, initialOutput: entry }), { code: "LOGIN_DENIED" });
+  assert.deepEqual(pty.writes, []);
+  await assert.rejects(authorizeConnectionLogin(host, { config: { denyCommandPatterns: ["sudo"] } }), { code: "LOGIN_DENIED" });
 });
 
 test("wait timeout, PTY exit and cancellation fail-stop and clean subscriptions", async () => {
@@ -250,7 +272,7 @@ test("delay is interrupted by PTY exit and literal waits do not authorize sends"
     onProgress: (p) => { if (p.state === "running") queueMicrotask(() => pty.close()); },
   }), { code: "LOGIN_EXIT" });
   assert.deepEqual(pty.writes, []);
-  await assert.rejects(authorizeConnectionLogin(profileOf([{ type: "wait", value: "Menu" }, { type: "command", value: "reboot" }])), { code: "LOGIN_DENIED" });
+  await assert.rejects(authorizeConnectionLogin(profileOf([{ type: "wait", value: "Menu" }, { type: "command", value: "reboot" }]), { config: { denyCommandPatterns: ["reboot"] } }), { code: "LOGIN_DENIED" });
 });
 
 test("default completion accepts a synthetic cluster-b K8S-RONLY prompt in streamed ANSI output", async () => {

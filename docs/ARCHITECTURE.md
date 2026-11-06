@@ -1452,8 +1452,8 @@ The relay authorizes all sends before opening the channel and rechecks the
 normalized profile with its original policy context before initialization.
 Commands/text/keys use the existing risk gate, including assembled text followed
 by Enter; editing/history makes the result unproven, not statically read-only.
-Waits and delays do not grant execution authority. No synthetic Agent or implicit
-approval is created when the user saves a flow.
+Waits and delays do not grant execution authority. This was the original v0.6.0
+approval contract; v0.6.3 below supersedes the approval rule for configured sends.
 
 After entrance authentication, an ordinary flow waits for the entry shell prompt.
 A first literal wait can instead select menu/custom-prompt readiness. Each action
@@ -1471,3 +1471,21 @@ ownership; adopting an initialized PTY does not replay actions. Host APIs persis
 validated action arrays and defensively copy every row. The editor supports all
 five types, sorting, bounded timeouts, literal completion and legacy target-root
 checks, and never presents incomplete progress as connected.
+
+## v0.6.3 — trusted configured initialization
+
+At the operator's explicit request, saved connection actions no longer ask for Agent
+approval. `authorizeConnectionLogin` and its pre-write revalidation use the static
+classifier only for deny patterns and read-only restrictions; configured high-risk
+commands (including `sudo su - root`) run even under always/never/unproven-ask modes.
+This is initialization-only: later Agent-submitted commands still use the unchanged
+approval gate. Allowlist checks, entrance read-only inheritance, no-secret validation,
+prompt/output completion, fail-stop and one initialization per new PTY remain intact.
+The editor explains that saved actions are trusted and run on every genuinely new channel.
+
+The local bridge also retains a cumulative 120-retry budget per process rather than
+resetting it on socket connect. A reachable local socket is not proof of an accepted
+session: missing-session attach can connect and immediately close. This avoids an
+unbounded `1/120` retry loop without interpreting untrusted raw terminal output as
+an acknowledgement. Repeated legitimate transport reconnects consume the same budget;
+open a fresh native terminal after exhaustion. This does not change SSH PTY retries.
