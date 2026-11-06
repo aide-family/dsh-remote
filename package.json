@@ -20,7 +20,8 @@
     "README.md",
     "LICENSE",
     "docs/icon.svg",
-    "docs/TERMINAL_ACTIONS.md"
+    "docs/TERMINAL_ACTIONS.md",
+    "docs/assets"
   ],
   "keywords": [
     "dsh",
@@ -57,7 +58,8 @@
     "pack:plugin": "mkdir -p dist && npm pack --pack-destination dist",
     "install:profile": "bash scripts/install-into-profile.sh",
     "dev:screenshot": "node scripts/dev-screenshot.mjs",
-    "dev:web": "node scripts/dev-web-test.mjs"
+    "dev:web": "node scripts/dev-web-test.mjs",
+    "docs:screenshots": "node scripts/docs-screenshots.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.5",

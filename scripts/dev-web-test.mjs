@@ -840,8 +840,8 @@ try {
   manifest.dsh ??= {};
   manifest.dsh.profile ??= {};
   manifest.dsh.profile.bundles ??= [];
-  if (!manifest.dsh.profile.bundles.includes("dsh-remote")) {
-    manifest.dsh.profile.bundles.push("dsh-remote");
+  if (!manifest.dsh.profile.bundles.includes("@aide-family/dsh-remote")) {
+    manifest.dsh.profile.bundles.push("@aide-family/dsh-remote");
     await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
   }
   const credentials = join(process.env.HOME ?? "", ".dsh", ".credentials.yaml");
@@ -873,7 +873,7 @@ if (process.env.DEV_WEB_SKIP_SYNC !== "1") {
     patchPath,
     [
       "- id: dsh-remote",
-      "  name: dsh-remote",
+      '  name: "@aide-family/dsh-remote"',
       "  config:",
       "    includeSshConfig: false",
       "    devLiveEvents: true",

@@ -2,6 +2,96 @@
 
 SSH remote-server operations for [DeepSeek Harness](https://www.deepseek.com/harness/) (DSH).
 
+## Quick start
+
+### 1. Install DSH
+
+`dsh-remote` is a DSH plugin, so install and launch DSH first.
+
+**Desktop app (recommended).** Download the official app for
+[macOS or Windows](https://www.deepseek.com/en/download/), open it, and finish the
+first-run sign-in. The desktop app bundles its own `dsh` CLI and Node.js.
+
+**CLI / Web UI.** Requires Node.js `>= 24.9.0`:
+
+```sh
+# run without a global install
+npx -y @deepseek-ai/dsh web
+
+# or install the CLI once and reuse it
+npm install -g @deepseek-ai/dsh
+dsh web
+```
+
+`dsh web` prints an authenticated local URL (for example
+`http://127.0.0.1:3080/`). Open it in a browser. Then check the version:
+
+```sh
+dsh --version   # must be >= 0.2.1-rc.5
+```
+
+> With the Desktop app, `dsh` may not be on your shell `PATH`; either use the
+> app or install the CLI as above. The plugin also needs SSH access to the
+> target hosts: key files, `ssh-agent`, or a password supplied through an
+> environment variable. `~/.ssh/config` settings (`HostName`, `User`, `Port`,
+> `IdentityFile`, `ProxyJump`) are honored.
+
+### 2. Install dsh-remote
+
+From npm:
+
+```sh
+dsh plugin --profile desktop add @aide-family/dsh-remote --ignore-scripts
+```
+
+From a local checkout:
+
+```sh
+cd /path/to/dsh-remote
+npm install                       # once: ssh2 + test devDependencies
+npm run install:profile           # packs dist/aide-family-dsh-remote-<version>.tgz and installs
+                                  # it into the "desktop" profile
+```
+
+Or pack and install manually into another profile:
+
+```sh
+npm run pack:plugin
+dsh plugin --profile desktop add file:$PWD/dist/aide-family-dsh-remote-0.6.1.tgz --ignore-scripts
+```
+
+Install into the profile you actually boot: `desktop` for the Desktop app, or
+`web` when you launched `dsh web` (the CLI also accepts `--profile web`).
+
+Then fully quit and reopen the DSH Desktop app (a newly installed bundle is
+loaded on the next boot), or boot the CLI profile you installed into. Open the
+**远程运维** panel in the sidebar, or ask the agent to call `remote_hosts`, to
+confirm the plugin loaded.
+
+> **`--ignore-scripts` is required with pnpm 11.** pnpm refuses to install
+> packages that declare unapproved install scripts, and `ssh2` declares an
+> install script for its *optional* native cipher-speed addon (`cpu-features`).
+> ssh2's pure-JavaScript implementation is fully functional without it, so
+> skipping the scripts is safe and avoids needing a C toolchain. (Alternatively,
+> add `allowBuilds: [ssh2, cpu-features]` to the profile's `pnpm-workspace.yaml`
+> and install without the flag; that does require a working compiler setup.)
+>
+> **Do not install a development checkout with `link:`.** DSH routes
+> `@deepseek-ai/*` imports only for packages that physically live inside the
+> profile's `node_modules`; a symlink to a directory outside the profile cannot
+> resolve them and the plugin fails to load. Use the tarball (`file:…tgz`) for
+> local installs, or the npm package when published.
+
+The plugin is a DSH **bundle**: installing it adds the
+`@aide-family/dsh-remote` package and a `dsh-remote` plugin row to the profile.
+To remove it:
+
+```sh
+dsh plugin --profile desktop remove @aide-family/dsh-remote
+```
+
+## What dsh-remote does
+
 `dsh-remote` lets the agent in your DSH session actually operate remote servers:
 list the hosts you already configured in `~/.ssh/config`, probe a box, run
 non-interactive commands, read and edit remote files over SFTP, and move files
@@ -13,6 +103,37 @@ It is inspired by the [Crescent](https://github.com/aide-family/Crescent)
 operations workbench: the same idea that the agent should gather evidence on the
 real host, one bounded action at a time, with risky commands reviewed before
 execution.
+
+## Screenshots
+
+The screenshots below come from an isolated documentation profile: synthetic
+hosts on RFC 5737 documentation addresses, a loopback SSH fixture, and synthetic
+command output. No real host, account, key, or local path is shown.
+
+**Remote Ops management page.** Host inventory, per-host detail, live shell
+sessions, and the recent-operation audit trail in one panel.
+
+![Remote Ops management page](docs/assets/remote-ops.png)
+
+**Live terminal mirror.** Every agent command streams into the conversation's
+right sidebar; the same panel opens DSH's native terminal on a chosen host.
+
+![Live terminal mirror](docs/assets/live-terminal.png)
+
+**Host manager.** Add, edit, or remove managed connections. Secrets stay as
+environment-variable names or key paths.
+
+![Host manager](docs/assets/host-manager.png)
+
+**Per-host audit.** Filter by host, expand the full command, or export
+JSON/CSV/TXT.
+
+![Per-host audit](docs/assets/host-audit.png)
+
+**Native remote terminal.** A real xterm attached to the per-conversation SSH
+session; close and re-open the tab to reattach it.
+
+![Native remote terminal](docs/assets/remote-terminal.png)
 
 ## Features
 
@@ -70,64 +191,6 @@ execution.
   missing answerer all fail closed.
 - **Hard limits** — per-host read-only lock, host allowlist, command deny
   patterns, output caps, transfer caps, and TOFU host-key verification.
-
-## Requirements
-
-- DSH `>= 0.2.1-rc.5` (bundled in the Desktop app and the `dsh` CLI).
-- Node.js `^22.19.0 || >=24.0.0` (already bundled with DSH).
-- SSH access to the target hosts: key files, `ssh-agent`, or a password supplied
-  through an environment variable. `~/.ssh/config` settings (`HostName`, `User`,
-  `Port`, `IdentityFile`, `ProxyJump`) are honored.
-
-## Install
-
-### From a local tarball (recommended for this checkout)
-
-```sh
-cd /path/to/dsh-remote
-npm install                       # once: ssh2 + test devDependencies
-npm run install:profile           # packs dist/aide-family-dsh-remote-<version>.tgz and installs
-                                  # it into the "desktop" profile
-```
-
-Or do the steps manually and choose another profile:
-
-```sh
-npm run pack:plugin
-dsh plugin --profile desktop add file:$PWD/dist/aide-family-dsh-remote-0.5.3.tgz --ignore-scripts
-```
-
-Then fully quit and reopen the DSH Desktop app (a newly installed bundle is
-loaded on the next boot), or boot the CLI profile you installed into.
-
-> **`--ignore-scripts` is required with pnpm 11.** pnpm refuses to install
-> packages that declare unapproved install scripts, and `ssh2` declares an
-> install script for its *optional* native cipher-speed addon (`cpu-features`).
-> ssh2's pure-JavaScript implementation is fully functional without it, so
-> skipping the scripts is safe and avoids needing a C toolchain. (Alternatively,
-> add `allowBuilds: [ssh2, cpu-features]` to the profile's `pnpm-workspace.yaml`
-> and install without the flag; that does require a working compiler setup.)
->
-> **Do not install a development checkout with `link:`.** DSH routes
-> `@deepseek-ai/*` imports only for packages that physically live inside the
-> profile's `node_modules`; a symlink to a directory outside the profile cannot
-> resolve them and the plugin fails to load. Use the tarball (`file:…tgz`) for
-> local installs, or the npm package when published.
-
-### From npm (when published)
-
-```sh
-dsh plugin --profile desktop add @aide-family/dsh-remote --ignore-scripts
-```
-
-### Where it lands
-
-The plugin is a DSH **bundle**: installing it adds the `@aide-family/dsh-remote`
-package and a `dsh-remote` plugin row to the profile. To remove the package:
-
-```sh
-dsh plugin --profile desktop remove @aide-family/dsh-remote
-```
 
 ## Configure
 
@@ -565,7 +628,7 @@ The npm package name is `@aide-family/dsh-remote`; the DSH plugin row id remains
 `NPM_TOKEN` with publish permission for the `@aide-family` scope. Do not put the
 token in the repository or a checked-in `.npmrc`.
 
-Pushing a tag that exactly matches the manifest version (for example, `v0.5.3`)
+Pushing a tag that exactly matches the manifest version (for example, `v0.6.1`)
 starts the [publish workflow](https://github.com/aide-family/dsh-remote/blob/main/.github/workflows/publish-npm.yml).
 The workflow installs from the lockfile, runs unit tests plus the DSH-independent
 integration suites, checks the tag/package version match, previews the tarball,
@@ -573,8 +636,8 @@ then publishes publicly with provenance.
 The publisher must have rights to create packages in the `@aide-family` scope.
 
 ```sh
-git tag v0.5.3
-git push origin v0.5.3
+git tag v0.6.1
+git push origin v0.6.1
 ```
 
 Published versions cannot be reused. If a release has a mistake, fix it and
@@ -650,7 +713,8 @@ test/
   unit/           pure-module tests
   integration/    fake-ctx plugin tests + fixture SSH server
   fixtures/       ssh-server.mjs
-scripts/          dev-profile, sync-profile, e2e, dev-web (browser loop), packaging
+scripts/          dev-profile, sync-profile, e2e, dev-web, docs-screenshots
+docs/assets/      README screenshots (generated from the synthetic profile only)
 ```
 
 Attribution: the command-risk classifier in `lib/policy/` is ported from the
@@ -674,9 +738,10 @@ contents before publication; never commit live connection records or secrets.
 ## Verification
 
 ```sh
-npm test        # 669 tests: unit + real-fixture integration (no external servers)
+npm test        # unit + real-fixture integration (no external servers)
 npm run e2e     # real DSH headless run against a fixture SSH server
 node scripts/dev-web-test.mjs --remote-terminal --docs-shots   # real browser loop (v0.5)
+npm run docs:screenshots   # regenerate docs/assets/ from an isolated synthetic profile
 ```
 
 The e2e suite proves the model actually calls the tools through the DSH pipeline,
@@ -684,8 +749,12 @@ that read-only remote actions work, that mutating actions fail closed in headles
 mode, that a persistent PTY shell opens, echoes a command, and closes cleanly,
 and that an unproven (gray) command now runs without approval. The management page is verified in a real browser against an isolated
 DSH Web profile (`npm run dev:web` boots it, drives it with headless Chrome, and
-writes a local screenshot). Historical screenshots were removed because they
-contained real connection details; do not publish unreviewed browser captures.
+writes a local screenshot). `npm run docs:screenshots` regenerates the README
+images from a profile that disables SSH-config discovery, contains only synthetic
+inventory and a loopback fixture, and refuses to write a capture if the page
+shows a real-looking host, account, or local path. Earlier screenshots were
+removed because they contained real connection details; the README now uses
+generated synthetic captures, but still review every image before publishing it.
 `--emit-live` verifies the v0.4 live mirror (guide entry, auto-open, streamed
 commands/output, session and host filters, scrolling, Clear). `--remote-terminal`
 boots the same profile with a real SSH fixture host and verifies v0.5 end to end:

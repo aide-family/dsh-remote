@@ -65,8 +65,8 @@ const manifest = JSON.parse(fs.readFileSync(file, "utf8"));
 manifest.dsh ??= {};
 manifest.dsh.profile ??= {};
 manifest.dsh.profile.bundles ??= [];
-if (!manifest.dsh.profile.bundles.includes("dsh-remote")) {
-  manifest.dsh.profile.bundles.push("dsh-remote");
+if (!manifest.dsh.profile.bundles.includes("@aide-family/dsh-remote")) {
+  manifest.dsh.profile.bundles.push("@aide-family/dsh-remote");
   fs.writeFileSync(file, `${JSON.stringify(manifest, null, 2)}\n`);
 }
 NODE
