@@ -14,6 +14,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import { createApprovalGate } from "../../lib/approval.js";
 import { normalizeConfig } from "../../lib/config.js";
 import { createShellTools } from "../../lib/terminal/tools.js";
+import { targetChecksDigest, targetConnectionDigest } from "../../lib/target-binding.js";
 
 const EXEC = { agent: { id: "agent-a" }, callId: "call-shell-1", signal: new AbortController().signal };
 
@@ -114,7 +115,7 @@ function fakeHosts({ readonly = false, allowed = true } = {}) {
   };
 }
 
-function mountTools({ config: overrides = {}, managerOptions = {}, hostOptions = {}, approvalOutcome = "allowed-once" } = {}) {
+function mountTools({ config: overrides = {}, managerOptions = {}, hostOptions = {}, approvalOutcome = "allowed-once", targets, onApproval } = {}) {
   const cfg = config(overrides);
   const approvalCalls = [];
   const ctx = {
@@ -123,6 +124,7 @@ function mountTools({ config: overrides = {}, managerOptions = {}, hostOptions =
       return {
         async request(request) {
           approvalCalls.push(request);
+          if (onApproval) await onApproval(cfg, request);
           return approvalOutcome;
         },
       };
@@ -136,6 +138,7 @@ function mountTools({ config: overrides = {}, managerOptions = {}, hostOptions =
     manager,
     approval,
     hosts: fakeHosts(hostOptions),
+    targets,
   });
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
   const run = (name, args, exec = EXEC) => byName.get(name).execute(args, exec);
@@ -193,12 +196,12 @@ test("mutating shell input is denied when approval rejects or is unavailable", a
   }
 });
 
-test("policy never denies mutating shell input but allows read-only input", async () => {
+test("policy never denies unverified PTY input instead of assuming read-only semantics", async () => {
   const { run, approvalCalls } = mountTools({
     config: { policy: "never" },
     managerOptions: { sessions: OPEN_SESSION() },
   });
-  await run("remote_shell_send", { sessionId: "remote-shell-1", text: "ls -la" });
+  await assert.rejects(run("remote_shell_send", { sessionId: "remote-shell-1", text: "ls -la" }), /Unverified PTY/);
   await assert.rejects(
     () => run("remote_shell_send", { sessionId: "remote-shell-1", text: "mv a b" }),
     /policy is "never"/,
@@ -230,10 +233,22 @@ test("denyCommandPatterns blocks shell input before approval", async () => {
   assert.equal(approvalCalls.length, 0);
 });
 
-test("raw input (submit false) is not classified and never asks", async () => {
+test("raw input requires independent approval and cannot contain hidden line submissions", async () => {
   const { run, approvalCalls } = mountTools({ managerOptions: { sessions: OPEN_SESSION() } });
   await run("remote_shell_send", { sessionId: "remote-shell-1", text: "\u0003", submit: false });
-  assert.equal(approvalCalls.length, 0);
+  assert.equal(approvalCalls.length, 1);
+  await assert.rejects(run("remote_shell_send", { sessionId: "remote-shell-1", text: "echo safe\r", submit: false }), { code: "SHELL_INPUT_INVALID" });
+  for (const text of ["echo safe\u0015touch /tmp/fixture", "echo safe\u001b[A", "ls\ttouch", "ls\ntouch /tmp/fixture"]) await assert.rejects(run("remote_shell_send", { sessionId: "remote-shell-1", text }), { code: "SHELL_INPUT_INVALID" });
+  assert.equal(approvalCalls.length, 1);
+});
+
+test("target-checked read-only text cannot bypass verified input readiness", async () => {
+  let guarded = 0;
+  const { run, manager } = mountTools({ config: { profiles: [{ name: 'checked', hosts: [HOST.name], targetChecks: [{ name: 'user', command: 'id -un', expected: 'fixture' }] }] },
+    managerOptions: { sessions: OPEN_SESSION() }, targets: { execute: async () => { guarded++; throw Object.assign(new Error('Prepare input context first'), { code: 'CONTEXT_RESET_REQUIRED' }); } } });
+  await assert.rejects(run('remote_shell_send', { sessionId: 'remote-shell-1', text: 'df -h' }), { code: 'CONTEXT_RESET_REQUIRED' });
+  assert.equal(guarded, 1);
+  assert.equal(manager.calls.filter(call => call[0] === 'send').length, 0);
 });
 
 test("remote_shell_read pages scrollback and renders pagination", async () => {
@@ -314,3 +329,22 @@ test("aborted execution signals never reach the manager", async () => {
   await assert.rejects(() => run("remote_shell_send", { sessionId: "remote-shell-1", text: "ls" }, aborted));
   assert.equal(manager.calls.filter(([name]) => name === "send").length, 0);
 });
+
+for (const submit of [true, false]) {
+  test(`SDK shell definition freezes pre-approval checks and refuses newly guarded ${submit ? "submitted" : "raw"} dispatch`, async () => {
+    let checks = []; let upgraded = 0; const dispatches = [];
+    const targets = { refresh: async () => {}, checksFor: () => checks,
+      dispatchCheck: async request => { dispatches.push(request); return { host: HOST, checks }; },
+      execute: async () => { upgraded++; throw new Error("Old approval must never upgrade to a guard"); },
+    };
+    const f = mountTools({ config: { policy: "always" }, managerOptions: { sessions: OPEN_SESSION() }, targets,
+      onApproval: () => { checks = [{ name: "new-identity", command: "hostname", expected: "fixture" }]; },
+    });
+    await assert.rejects(f.run("remote_shell_send", { sessionId: "remote-shell-1", text: submit ? "hostname" : "\u0003", submit }), { code: "TARGET_CONFIG_CHANGED" });
+    assert.equal(f.manager.calls.filter(([name]) => name === "send").length, 0);
+    assert.equal(upgraded, 0); assert.equal(dispatches.length, 1);
+    assert.equal(dispatches[0].expectedChecksHash, targetChecksDigest([]));
+    assert.equal(dispatches[0].expectedConnectionDigest, targetConnectionDigest(HOST));
+    assert.equal(dispatches[0].approvedOnce, true);
+  });
+}

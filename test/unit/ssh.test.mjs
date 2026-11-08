@@ -485,7 +485,7 @@ test('exec: pty option is accepted and runs the command', async (t) => {
   assert.match(result.stdout, /pty-ok/)
 })
 
-test('exec: channel-level failure retries once on a fresh connection', async (t) => {
+test('exec: uncertain channel failure is not automatically replayed', async (t) => {
   const { srv, transport, host, close } = await setup()
   t.after(close)
 
@@ -494,9 +494,11 @@ test('exec: channel-level failure retries once on a fresh connection', async (t)
   assert.equal(srv.connectionTotal, 1)
 
   srv.failNextExec()
-  const result = await transport.exec(host, { command: 'printf retried' })
-  assert.equal(result.stdout, 'retried')
-  assert.equal(srv.connectionTotal, 2, 'the failed channel must be retried on exactly one fresh connection')
+  await assert.rejects(transport.exec(host, { command: 'printf must-not-replay' }), isChannelFailure)
+  assert.equal(srv.connectionTotal, 1, 'channel failure must not replay the command on a new connection')
+  const result = await transport.exec(host, { command: 'printf explicit-next-action' })
+  assert.equal(result.stdout, 'explicit-next-action')
+  assert.equal(srv.connectionTotal, 2, 'an explicit next action may acquire a fresh connection')
 })
 
 /* ================================================================== */
@@ -757,6 +759,29 @@ test('sftp: withSftp provides a dedicated channel, passes the host, and serializ
   assert.deepEqual(results, ['first', 'second'])
   assert.ok(elapsed >= 250, `withSftp must serialize per host (took ${elapsed}ms)`)
   assert.equal(srv.connectionTotal, 1)
+})
+
+test('sftp: abort settles a stalled callback and releases the host queue', async (t) => {
+  const { transport, host, close } = await setup()
+  t.after(close)
+  const controller = new AbortController()
+  let entered
+  const ready = new Promise(resolve => { entered = resolve })
+  const pending = transport.withSftp(host, () => { entered(); return new Promise(() => {}) }, { signal: controller.signal })
+  const rejected = assert.rejects(pending, { name: 'AbortError' })
+  await ready
+  controller.abort()
+  await rejected
+  const next = await transport.exec(host, { command: 'printf queue-released' })
+  assert.equal(next.stdout, 'queue-released')
+})
+
+test('sftp: stalled callback times out without retrying an unknown operation', async (t) => {
+  const { transport, host, close } = await setup({ transportOptions: { execTimeoutMs: 30 } })
+  t.after(close)
+  let attempts = 0
+  await assert.rejects(transport.withSftp(host, () => { attempts++; return new Promise(() => {}) }), { code: 'TIMEOUT' })
+  assert.equal(attempts, 1)
 })
 
 test('sftp: homeDir resolves via REALPATH "." and is cached per connection', async (t) => {

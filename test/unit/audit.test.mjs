@@ -44,7 +44,7 @@ test("normalizes outcomes and bounds the detail", () => {
   const error = audit.record({ tool: "t", outcome: "error" });
   assert.equal(error.outcome, "error");
   const ok = audit.record({ tool: "t", outcome: "something-else" });
-  assert.equal(ok.outcome, "ok");
+  assert.equal(ok.outcome, "unknown");
   assert.equal(ok.host, "—");
   assert.equal(boundDetail("  a   b  "), "a b");
 });

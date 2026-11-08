@@ -578,6 +578,10 @@ describe("Config schema", () => {
       includeSshConfig: true,
       sshConfigPath: "~/.ssh/config",
       policy: "auto",
+      profiles: [],
+      auditLimit: 500,
+      auditMaxBytes: 8_388_608,
+      auditRetentionDays: 30,
       readonlyHosts: [],
       allowHosts: [],
       denyCommandPatterns: [],
@@ -1055,5 +1059,29 @@ describe("createHostStore with a managed registry", () => {
     assert.equal(store.isReadonly({ name: "prod-web-1" }), false);
     await assert.rejects(store.find("missing"), (error) => /** @type {any} */ (error).code === "UNKNOWN_HOST");
     assert.equal(typeof (await store.fingerprint()), "string");
+  });
+});
+
+describe("shortcut safety metadata", () => {
+  it("inherits entrance-name and entrance-tag policies without replacing shortcut tags", async () => {
+    const config = normalizeConfig({ includeSshConfig: false, hosts: [
+      { name: "prod-entry", host: "192.0.2.20", tags: ["prod", "bastion"] },
+      { name: "cluster-a", viaHost: "prod-entry", tags: ["cluster"], actions: [{ type: "command", value: "connect-cluster cluster-a" }] },
+    ] });
+    const hosts = await loadHosts(config);
+    const shortcut = hosts.find((host) => host.name === "cluster-a");
+    assert.deepEqual(shortcut.tags, ["cluster"]);
+    assert.deepEqual(shortcut.connectionPolicyNames, ["prod-entry"]);
+    assert.deepEqual(shortcut.connectionPolicyTags, ["prod", "bastion"]);
+    shortcut.connectionPolicyTags.push("test-only");
+    assert.deepEqual(hosts.find((host) => host.name === "prod-entry").tags, ["prod", "bastion"]);
+  });
+
+  it("retains production tags of a managed entrance for a configured shortcut", async () => {
+    const config = normalizeConfig({ includeSshConfig: false, hosts: [
+      { name: "cluster-a", viaHost: "managed-entry", tags: ["cluster"], actions: [{ type: "command", value: "connect-cluster cluster-a" }] },
+    ] });
+    const hosts = await loadHosts(config, { registryHosts: [{ name: "managed-entry", host: "192.0.2.21", tags: ["prod"] }] });
+    assert.deepEqual(hosts.find((host) => host.name === "cluster-a").connectionPolicyTags, ["prod"]);
   });
 });

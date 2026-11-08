@@ -10,6 +10,7 @@ import test from 'node:test'
 import { startSshServer } from '../fixtures/ssh-server.mjs'
 import { createSshTransport } from '../../lib/ssh/transport.js'
 import { createShellManager } from '../../lib/terminal/manager.js'
+import { targetConnectionDigest } from '../../lib/target-binding.js'
 
 const CONNECT_TIMEOUT_MS = 5_000
 const IDLE_SILENCE_MS = 400
@@ -144,6 +145,7 @@ test('remote shell manager: real SSH fixture end to end', async (t) => {
       sessionId: opened.sessionId,
       host: 'fixture',
       status: { kind: 'running' },
+      connectionDigest: targetConnectionDigest(host),
     })
     const listA = manager.list(agentA)
     assert.equal(listA.length, 1)
@@ -399,6 +401,7 @@ test('remote shell manager: admin surface sees every owner without fencing agent
     sessionId: openedB.sessionId,
     host: 'fake',
     status: { kind: 'running' },
+    ownerSessionId: agentB.id,
   })
   assert.equal(manager.adminGet('remote-shell-9999'), undefined)
   assert.equal(manager.adminGet(undefined), undefined)

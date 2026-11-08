@@ -1,7 +1,7 @@
 {
   "name": "@aide-family/dsh-remote",
-  "version": "0.6.3",
-  "description": "SSH remote-server operations for DeepSeek Harness: host discovery from ~/.ssh/config, remote command execution, SFTP file tools, and Crescent-style command risk review with approval gating.",
+  "version": "0.9.1",
+  "description": "DSH remote operations workbench with SSH host management, safe file changes, runtime target checks, approval-gated commands and truthful audit.",
   "type": "module",
   "main": "lib/index.js",
   "engines": {
@@ -18,9 +18,11 @@
     "bin/dsh-remote-terminal",
     "cordis.patch.yml",
     "README.md",
+    "TODO.md",
     "LICENSE",
     "docs/icon.svg",
     "docs/TERMINAL_ACTIONS.md",
+    "docs/TARGET_CHECKS.md",
     "docs/assets"
   ],
   "keywords": [
@@ -49,6 +51,9 @@
     }
   },
   "scripts": {
+    "build:client": "node scripts/build-target-client.mjs",
+    "pretest": "node scripts/build-target-client.mjs",
+    "prepack": "node scripts/build-target-client.mjs",
     "test": "node --test test/unit/*.test.mjs test/integration/*.test.mjs",
     "test:unit": "node --test test/unit/*.test.mjs",
     "test:integration": "node --test test/integration/*.test.mjs",
@@ -85,7 +90,11 @@
     "ssh2": "^1.17.0"
   },
   "devDependencies": {
-    "@deepseek-ai/dsh-tools": "^0.2.1-rc.5",
+    "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-sandbox": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-scope": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.5",
     "@deepseek-ai/schemastery": "~3.18.5",
     "playwright-core": "^1.64.1"
   }

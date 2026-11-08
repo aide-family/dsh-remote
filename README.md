@@ -192,6 +192,139 @@ session; close and re-open the tab to reattach it.
 - **Hard limits** — per-host read-only lock, host allowlist, command deny
   patterns, output caps, transfer caps, and TOFU host-key verification.
 
+## Production change safety
+
+### Safe file changes and approved recovery
+
+`remote_write` and `remote_edit` now show a bounded contextual Diff in the approval
+request. Before overwriting, the plugin durably saves the original file under
+`$DSH_HOME/remote/backups` (directory 0700, records 0600), then re-reads the target
+**after approval**. A content/owner/group/mode version conflict stops the change;
+it never silently overwrites a file modified while you were reviewing it.
+
+Results include `backupId`, `beforeVersion`, and `afterVersion`. To recover an
+existing file, ask the Agent to call `remote_restore(host, backup_id)`. Recovery
+has its own Diff approval, backs up the current file, and refuses a changed
+connection endpoint or a file that no longer matches the recorded changed
+version. An invalid/corrupted backup is rejected. Newly created files have no
+original to restore: deleting them is a separate destructive operation.
+
+Optional `verify_command` and `verify_timeout_ms` on write/edit/restore authorize
+a validation command independently **before** the file change and run it once
+**after** the change. For example, use `nginx -t` before deciding whether to
+request a separate reload. Failed, cancelled, or timed-out validation leaves a
+recovery record and stops the tool; it does not reload or automatically restore.
+
+Important boundaries:
+
+- Only bounded regular files are changed; symlink destinations are rejected.
+  Supported POSIX owner/group/mode are preserved before atomic replacement;
+  missing metadata or inability to preserve it fails closed. New files default
+  to private mode 0600. ACLs/xattrs/SELinux labels/hard-link identity are not preserved.
+- Writes require an absolute path; relative SFTP paths are resolved against the
+  remote home. Backup capacity is 1000 records / 64 MiB; a full or unavailable
+  backup store blocks overwrites rather than silently deleting recovery points.
+- Plugin changes serialize by normalized endpoint/user/path. Parent-directory
+  symlinks, different endpoint names/users, and external writers are not a global
+  physical-file lock. Revalidation is **not** an atomic filesystem CAS.
+- SFTP servers must support atomic replacement (regular or OpenSSH POSIX rename).
+  There is no delete-original-and-rename fallback. Uncertain exec/file-write
+  failures are not automatically replayed.
+- Approval Diff may contain sensitive configuration and is for the operator;
+  file contents and full Diff are not written to operation audit or denial logs.
+
+### Per-host / tag safety profiles
+
+Use `profiles` to tighten production operations without making every test host
+strict. Host-name selectors are case-insensitive `*`/`?` globs; tags are exact,
+case-sensitive matches. Hosts **or** tags can select a profile. Every matching
+profile composes restrictively: readonly and denies accumulate, `never` overrides
+`always`/`auto`, and unknown-command approval cannot be weakened by another rule.
+Profiles never loosen global locks or policy.
+
+```yaml
+- id: dsh-remote
+  config:
+    policy: auto
+    unprovenCommands: allow
+    profiles:
+      - name: production
+        hosts: ["prod-*"]
+        tags: [prod]
+        environment: production
+        unprovenCommands: ask
+        impact: "可能影响生产服务可用性；确认完整命令与目标"
+      - name: protected-db
+        tags: [critical-db]
+        readonly: true
+        denyCommandPatterns: ['\b(reboot|shutdown|mkfs)\b']
+    auditLimit: 500
+    auditMaxBytes: 8388608
+    auditRetentionDays: 30
+```
+
+An environment of `prod` or `production` itself requires approval for unknown
+commands, even if that profile specifies `allow`. No profiles preserves the
+existing default. Approval includes the logical host, real SSH connection target,
+matched profiles/environment, configured impact and complete command (commands
+larger than 64 KiB are rejected, not approved from a truncated summary).
+
+Cluster shortcuts inherit entrance policy names **and tags** so a shortcut cannot
+hide a production entrance. Approval distinguishes that entrance from the
+initialized terminal destination. This is not continuous attestation of the
+current shell destination or kubectl context/namespace; verify these explicitly
+before dangerous operations. Previously saved trusted connection actions still
+initialize once without Agent approval, as requested; subsequent Agent commands
+remain gated. Direct human terminal input remains operator-owned.
+
+### Truthful operation audit
+
+A returned tool call is not proof of a successful change. Audit distinguishes
+remote nonzero exit, timeout, cancellation, denial, unknown completion and failed
+validation, and correlates calls/sessions/agents with operation IDs. File changes
+retain backup/version/validation facts, not file contents. Command and result
+summaries are bounded and redacted; do not embed credentials in commands.
+
+Retention is bounded by count, bytes and age **during operation**, not only on
+restart. Age cleanup is triggered by record/list/count/health access; there is no
+background expiry timer while the application is idle. The management API
+(`audit.health`, `overview.auditHealth`, `audit.list.health`) exposes persistence
+health and cumulative write failures; health polling or flush can retry retained
+pending records after storage recovers. `retainedBytes` describes the in-memory
+retained JSONL, not a disk measurement after a write failure.
+
+Writes use a short exclusive lock and merge only newly pending operations with
+the current disk tail, preventing normal cross-instance lost updates and revival
+of already-cleared history. A live or crash-left `.audit.jsonl.lock` makes writes
+fail visibly; never remove it while writers are running. Stop writers and verify
+the recorded PID before manually recovering a stale lock. One private fixed
+`.audit.jsonl.tmp` bounds crash leftovers; `auditMaxBytes` caps the active JSONL,
+not the extra temporary copy. Audit directories must remain trusted and private.
+Exports paginate the retained trail (up to 10000 rows) and reject detected changes
+during export rather than silently producing a partial file.
+
+Command redaction covers common named secrets, PEM and URL credentials, but is
+best-effort, not a guarantee for arbitrary embedded secrets or custom headers.
+This local audit remains editable by the local operator; it is not a tamper-proof
+compliance log. See [TODO](TODO.md) for the remaining batch inspection/change,
+monitoring and multi-user work.
+
+## Runtime target checks
+
+Target checks remain available independently of any workflow feature. Open
+**远程运维**, select a logical host and click **目标检查** to manage exact expected
+identity/context facts. Saving only changes operator settings; it never runs a
+probe or grants remote execution permission. Configured checks remain read-only
+and compose restrictively with page-managed checks.
+
+Use `remote_target_check` to inspect actual declared facts. Guarded commands use
+nonce frames and explicit exit codes in the actual POSIX exec/owned PTY context;
+unknown input requires separately approved preparation. Current policy, check
+hash and connection/action routing are revalidated before dispatch. Existing
+SSH host management, safe file changes, command approvals and truthful audit remain.
+
+See [target configuration and safety boundaries](docs/TARGET_CHECKS.md).
+
 ## Configure
 
 All settings live on the plugin's row in the profile patch. The desktop profile
@@ -366,7 +499,8 @@ results or approval prompts.
 | `remote_read` | yes | Read a remote text file with line numbers, `offset`/`limit`, and a continue hint. |
 | `remote_list` | yes | List a remote directory with type/size/mtime/mode. |
 | `remote_write` | no | Write a remote file atomically, creating missing directories. |
-| `remote_edit` | no | Replace one exact string in a remote file (or all with `replace_all`). |
+| `remote_edit` | no | Replace one exact string with Diff approval, backup, version check and optional validation. |
+| `remote_restore` | no | Restore an existing file from a bound backup, with Diff approval and a new recovery point. |
 | `remote_transfer` | no | Upload/download between the session workspace and the host. |
 | `remote_shell_open` | no | Open a persistent interactive PTY shell on a host. |
 | `remote_shell_send` | per line | Write input (Enter submitted by default) and wait for output silence/timeout/exit. |
@@ -544,7 +678,7 @@ The plugin registers a first-level sidebar panel in the DSH Web/Desktop GUI:
 | Connection rail + host workbench | The connection rail selects a discovered host; the workbench shows source, `user@host:port`, auth hint, readonly / allowHosts policy, connectivity, terminal and Agent-session state, and the selected host's actions. |
 | Host actions | **测试连接 / Test connection** runs a read-only probe (connect + `uname -srm; hostname`) and shows latency/output; **连接** creates a conversation, opens its native terminal, and hands the host to the Agent using the same conversation-host PTY; **审计**, **编辑** / **删除** for managed hosts. **添加主机** opens the connection form. |
 | Remote shell sessions | Live `remote_shell_*` sessions for every agent (session id, host, status) with a bounded scrollback preview and a **结束会话 / Close** action. |
-| Recent operations | The newest **20** audit entries: time, tool, host, action, risk level (low/gray/high/write), outcome (ok / denied / error), duration, and the command/path, with a JSON/CSV/TXT export of the full retained trail. |
+| Recent operations | The newest **20** audit entries: time, tool, host, action, risk level (low/gray/high/write), outcome (success / failure / denied / cancelled / timeout / unknown / validation failure), duration, and the bounded redacted command/path, with a JSON/CSV/TXT export of the full retained trail. |
 
 ### Host manager
 
@@ -562,8 +696,8 @@ are listed read-only here (edit/delete only for managed entries).
 **审计** on a host row opens that host's operation history from the same audit
 trail: every model-facing remote call (tool, action, risk, outcome, duration,
 command/path) plus interactive-terminal lifecycle events (open / attach /
-reconnect / close). Each row expands to the **complete** command (the raw text,
-whitespace preserved — the table keeps a short one-line summary), and
+reconnect / close). Each row expands to the bounded, redacted command (whitespace
+preserved — the table keeps a short one-line summary) and correlation/recovery facts, and
 JSON / CSV / TXT export covers either the current host or the whole retained
 trail. User keystrokes typed in the interactive terminal are never recorded
 (they can contain passwords typed at a sudo prompt).
@@ -607,7 +741,7 @@ config if you do not want the route registered.
 ## Development
 
 ```sh
-npm install                       # ssh2 + test devDependencies
+npm install --ignore-scripts --legacy-peer-deps  # ssh2 + explicit test SDK peers
 npm test                          # unit + integration tests (no real servers)
 npm run e2e                       # real DSH headless run against a fixture SSH server
 npm run dev:profile               # create the isolated DSH dev profile

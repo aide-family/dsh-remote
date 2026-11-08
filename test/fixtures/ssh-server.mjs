@@ -850,6 +850,10 @@ export async function startSshServer(options = {}) {
               deliverSignal('INT')
               input = input.split('\x03').join('')
             }
+            // Ctrl-U erases the currently buffered line in this input chunk.
+            // This pipe fixture is not a native tty; reset also uses SIGINT to
+            // discard any shell parser state from previously delivered input.
+            if (input.includes('\x15')) input = input.replace(/[^\r\n]*\x15/gu, '')
             if (input.includes('\x1a')) {
               deliverSignal('TSTP')
               input = input.split('\x1a').join('')

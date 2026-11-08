@@ -11,7 +11,10 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile as readLocal, rm, writeFile as writeLocal } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { test, after } from "node:test";
+import { mkdtempSync } from "node:fs";
+const backupRoots = [];
+after(async () => { for (const root of backupRoots) await rm(root, { recursive: true, force: true }); });
 
 import { defineTool } from "@deepseek-ai/dsh-tools";
 
@@ -30,6 +33,7 @@ const TOOL_ORDER = [
   "remote_write",
   "remote_edit",
   "remote_transfer",
+  "remote_restore",
 ];
 
 /** @returns {object} A normalized config with the documented defaults. */
@@ -241,6 +245,7 @@ function createFakeTransport(options = {}) {
           size: file.content.length,
           mtimeMs: file.mtimeMs,
           mode: file.mode,
+          uid: file.uid, gid: file.gid,
         };
       }
       if (entries.has(path)) return { type: "dir", size: 0, mtimeMs: 0, mode: 0o755 };
@@ -269,6 +274,7 @@ function createFakeTransport(options = {}) {
         type: "file",
         content: buffer,
         mode: callOptions?.mode ?? existing?.mode ?? 0o644,
+        uid: callOptions?.uid ?? existing?.uid ?? 1000, gid: callOptions?.gid ?? existing?.gid ?? 1000,
         mtimeMs: 0,
       });
       return { bytesWritten: buffer.length };
@@ -299,12 +305,13 @@ function createFakeTransport(options = {}) {
 /** @returns {object} */
 function normalizeFakeFile(value) {
   if (typeof value === "string" || Buffer.isBuffer(value)) {
-    return { type: "file", content: Buffer.from(value), mode: 0o644, mtimeMs: 1_700_000_000_000 };
+    return { type: "file", content: Buffer.from(value), mode: 0o644, uid: 1000, gid: 1000, mtimeMs: 1_700_000_000_000 };
   }
   return {
     type: value.type ?? "file",
     content: Buffer.from(value.content ?? ""),
     mode: value.mode ?? 0o644,
+    uid: value.uid ?? 1000, gid: value.gid ?? 1000,
     mtimeMs: value.mtimeMs ?? 1_700_000_000_000,
   };
 }
@@ -333,7 +340,9 @@ function makeHarness(options = {}) {
   const workspace = options.workspace ?? process.cwd();
   const cwdOf = options.cwdOf ?? (async () => workspace);
   const exec = options.exec ?? makeExec();
-  const tools = createTools({ defineTool, config, transport, hosts, approval, cwdOf, logger: options.logger });
+  const backupRoot = mkdtempSync(join(tmpdir(), "dsh-remote-tool-backups-"));
+  backupRoots.push(backupRoot);
+  const tools = createTools({ backupRoot, defineTool, config, transport, hosts, approval, cwdOf, logger: options.logger });
   const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
   return { config, transport, hosts, approval, tools, byName, exec, workspace };
 }
@@ -393,7 +402,7 @@ function probeExecResult() {
 // Tool surface
 // ---------------------------------------------------------------------------
 
-test("createTools returns the eight tools in protocol order with complete definitions", () => {
+test("createTools returns the nine tools in protocol order with complete definitions", () => {
   const harness = makeHarness();
   assert.deepEqual(
     harness.tools.map((tool) => tool.name),
@@ -948,7 +957,10 @@ test("remote_write asks approval before creating a file and reports bytes", asyn
   assert.equal(writeCall.options.mode, undefined);
 
   const text = renderText(harness, "remote_write", {}, value);
-  assert.equal(text, "Wrote 12 bytes to prod-web-1:/home/ops/notes.txt (created).");
+  assert.ok(text.startsWith("Wrote 12 bytes to prod-web-1:/home/ops/notes.txt (created)."));
+  assert.match(text, new RegExp(`Backup ID: ${value.backupId}`));
+  assert.match(text, /Before version: absent/);
+  assert.match(text, new RegExp(`After version: ${value.afterVersion}`));
 });
 
 test("remote_write preserves the mode of an existing file and honors create_dirs", async () => {
@@ -966,8 +978,8 @@ test("remote_write preserves the mode of an existing file and honors create_dirs
   const writeCall = harness.transport.calls.find((call) => call.method === "writeFile");
   assert.equal(writeCall.options.createDirs, true);
   assert.equal(writeCall.options.mode, 0o600);
-  const chmodCall = harness.transport.calls.find((call) => call.method === "chmod");
-  assert.equal(chmodCall.mode, 0o600);
+  const writeMetadata = harness.transport.calls.find((call) => call.method === "writeFile").options;
+  assert.equal(writeMetadata.mode, 0o600);
   const text = renderText(harness, "remote_write", {}, value);
   assert.match(text, /\(replaced, mode 0o600\)/);
 });
@@ -1018,14 +1030,17 @@ test("remote_edit replaces one occurrence after reading, preserving mode", async
   const methodOrder = harness.transport.calls
     .filter((call) => call.method === "stat" || call.method === "readFile" || call.method === "writeFile")
     .map((call) => call.method);
-  assert.deepEqual(methodOrder, ["stat", "readFile", "writeFile"]);
+  assert.deepEqual(methodOrder, ["stat", "readFile", "stat", "readFile", "writeFile", "stat", "readFile"]);
   const writeCall = harness.transport.calls.find((call) => call.method === "writeFile");
   assert.equal(writeCall.content.toString("utf8"), "mode = fast\nport = 8080\n");
   assert.equal(writeCall.options.mode, 0o640);
-  const chmodCall = harness.transport.calls.find((call) => call.method === "chmod");
-  assert.equal(chmodCall.mode, 0o640);
+  const writeMetadata = harness.transport.calls.find((call) => call.method === "writeFile").options;
+  assert.equal(writeMetadata.mode, 0o640);
   const text = renderText(harness, "remote_edit", {}, value);
-  assert.equal(text, "Edited prod-web-1:/etc/app.conf: 1 replacement, 24 bytes written.");
+  assert.ok(text.startsWith("Edited prod-web-1:/etc/app.conf: 1 replacement, 24 bytes written."));
+  assert.match(text, new RegExp(`Backup ID: ${value.backupId}`));
+  assert.match(text, new RegExp(`Before version: ${value.beforeVersion}`));
+  assert.match(text, new RegExp(`After version: ${value.afterVersion}`));
 });
 
 test("remote_edit fails on zero matches before asking approval", async () => {

@@ -112,13 +112,13 @@ function createFakeContext({ approvalOutcome = "allowed-once", cwd } = {}) {
  * Stable Agent identity, as DSH passes the same live Agent object to every tool
  * call of one session (the shell manager fences sessions by exact identity).
  */
-const AGENT = { id: "test-agent" };
+const AGENT = { id: "test-agent", session: { id: "test-session" } };
 
 /** Execute one registered tool the way the DSH registry would. */
-async function runTool(tools, name, args, signal = AbortSignal.timeout(30_000)) {
+async function runTool(tools, name, args, signal = AbortSignal.timeout(30_000), execution = {}) {
   const tool = tools.find((candidate) => candidate.name === name);
   assert.ok(tool !== undefined, `tool ${name} is not registered`);
-  return tool.execute(args, { agent: AGENT, callId: `call-${name}`, signal });
+  return tool.execute(args, { agent: AGENT, callId: `call-${name}`, signal, ...execution });
 }
 
 /** @type {Awaited<ReturnType<typeof startSshServer>>} */
@@ -127,6 +127,7 @@ let workspace;
 let previousDshHome;
 let previousPassword;
 let testDshHome;
+const mounted = [];
 
 test.before(async () => {
   server = await startSshServer();
@@ -139,6 +140,12 @@ test.before(async () => {
 });
 
 test.after(async () => {
+  for (const fake of mounted.reverse()) {
+    for (const effect of [...fake.effects].reverse()) {
+      const dispose = effect();
+      if (typeof dispose === "function") await dispose();
+    }
+  }
   await server?.close();
   if (workspace !== undefined) await rm(workspace, { recursive: true, force: true });
   if (previousDshHome === undefined) delete process.env.DSH_HOME;
@@ -179,6 +186,8 @@ function baseConfig(overrides = {}) {
     promptGuidance: true,
     managementApi: false,
     liveTerminal: false,
+    // Most tests exercise Agent PTYs, not native-terminal relay sockets.
+    userTerminal: false,
     ...overrides,
   };
 }
@@ -187,11 +196,13 @@ function baseConfig(overrides = {}) {
 function mount(config, options = {}) {
   const fake = createFakeContext({ cwd: workspace, ...options });
   apply(fake.ctx, config);
+  mounted.push(fake);
   return fake;
 }
 
 test("apply registers the remote tools, shell tools and prompt sections", () => {
   const { tools, sections, effects } = mount(baseConfig());
+  assert.equal(tools.length, 16);
   assert.deepEqual(
     tools.map((tool) => tool.name),
     [
@@ -203,12 +214,14 @@ test("apply registers the remote tools, shell tools and prompt sections", () => 
       "remote_write",
       "remote_edit",
       "remote_transfer",
+      "remote_restore",
       "remote_shell_open",
       "remote_shell_send",
       "remote_shell_read",
       "remote_shell_signal",
       "remote_shell_close",
       "remote_shell_list",
+      "remote_target_check",
     ],
   );
   assert.equal(sections.length, 2);
@@ -227,7 +240,7 @@ test("apply registers the remote tools, shell tools and prompt sections", () => 
 
 test("terminalEnabled=false keeps the shell surface out", () => {
   const { tools, sections } = mount(baseConfig({ terminalEnabled: false }));
-  assert.equal(tools.length, 8);
+  assert.equal(tools.length, 10);
   assert.equal(sections.length, 1);
 });
 
@@ -426,6 +439,7 @@ test("remote shell session runs over the real PTY transport", async () => {
     });
     assert.equal(sent.waitReason === "inferred_idle" || sent.waitReason === "timeout", true);
     assert.match(sent.viewport, /shell-integration-ok/);
+    assert.equal((await latestAudit()).outcome, sent.waitReason === "timeout" ? "timed_out" : "unknown", "PTY silence cannot prove command success");
 
     const page = await runTool(tools, "remote_shell_read", { sessionId: opened.sessionId, count: 50 });
     assert.match(page.text, /shell-integration-ok/);
@@ -447,4 +461,134 @@ test("unknown hosts and disallowed hosts fail with actionable errors", async () 
     () => runTool(tools, "remote_exec", { description: "x", host: "testbox", command: "ls" }),
     /allowHosts/,
   );
+});
+
+async function auditEntries() {
+  const text = await readFile(join(testDshHome, "remote", "audit.jsonl"), "utf8");
+  return text.trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
+}
+async function latestAudit() {
+  return (await auditEntries()).at(-1);
+}
+
+test("audit correlates each invocation with SDK identities and never treats nonzero exit as ok", async () => {
+  const { tools } = mount(baseConfig());
+  const exec = { callId: "audit-call-reused", rootCallId: "audit-root" };
+  const value = await runTool(tools, "remote_exec", { description: "inspect exit status", host: "testbox", command: "sh -c 'exit 7'" }, undefined, exec);
+  assert.equal(value.exitCode, 7);
+  const failed = await latestAudit();
+  assert.equal(failed.outcome, "failed");
+  assert.equal(failed.exitCode, 7);
+  assert.equal(failed.callId, exec.callId);
+  assert.equal(failed.rootCallId, exec.rootCallId);
+  assert.equal(failed.agentId, AGENT.id);
+  assert.equal(failed.sessionId, AGENT.session.id);
+  assert.match(failed.operationId, /^[0-9a-f-]{36}$/);
+  await runTool(tools, "remote_exec", { description: "inspect hostname", host: "config:testbox", command: "hostname" }, undefined, exec);
+  const succeeded = await latestAudit();
+  assert.equal(succeeded.outcome, "ok");
+  assert.equal(succeeded.host, "testbox", "successful audit targets the resolved logical host, not lookup id");
+  assert.equal(succeeded.exitCode, 0);
+  assert.notEqual(succeeded.operationId, failed.operationId, "a reused call ID never reuses an operation ID");
+  assert.equal(succeeded.callId, failed.callId);
+});
+
+test("audit records timeout, cancellation and lost-channel unknown instead of success", async () => {
+  const { tools } = mount(baseConfig());
+  const timed = await runTool(tools, "remote_exec", { description: "bounded wait", host: "testbox", command: "sleep 1", timeout_ms: 50 });
+  assert.equal(timed.timedOut, true);
+  const timeout = await latestAudit();
+  assert.equal(timeout.outcome, "timed_out");
+  assert.equal(timeout.timedOut, true);
+  await assert.rejects(runTool(tools, "remote_exec", { description: "cancelled inspection", host: "testbox", command: "hostname" }, AbortSignal.abort()), { name: "AbortError" });
+  assert.equal((await latestAudit()).outcome, "cancelled");
+  server.failNextExec();
+  await assert.rejects(runTool(tools, "remote_exec", { description: "inspect broken channel", host: "testbox", command: "hostname" }));
+  assert.equal((await latestAudit()).outcome, "unknown");
+});
+
+test("audit only stores safe summaries and redacted command metadata, never stdout or rejected Diff", async () => {
+  const { tools } = mount(baseConfig());
+  const secret = "plugin-audit-secret-do-not-persist";
+  const value = await runTool(tools, "remote_exec", { description: "synthetic secret output", host: "testbox", command: `printf 'token=${secret}'` });
+  assert.ok(value.stdout.includes(secret));
+  const entry = await latestAudit();
+  assert.ok(!JSON.stringify(entry).includes(secret));
+  assert.ok(entry.detailFull.includes("REDACTED"));
+  assert.equal("stdout" in entry, false);
+  assert.equal("stderr" in entry, false);
+  const privateFile = "PRIVATE_FILE_SENTINEL_WITHOUT_SECRET_LABEL";
+  const path = join(server.rootDir, "audit-private.txt");
+  await writeFile(path, privateFile);
+  const denied = mount(baseConfig(), { approvalOutcome: "rejected" });
+  await assert.rejects(runTool(denied.tools, "remote_edit", { host: "testbox", path, old_string: privateFile, new_string: "replacement" }), /rejected/);
+  const rejection = await latestAudit();
+  assert.equal(rejection.outcome, "denied");
+  assert.ok(!JSON.stringify(rejection).includes(privateFile));
+  assert.ok(!denied.warnings.some(warning => warning.includes(privateFile)));
+  assert.equal("preview" in rejection, false);
+  assert.equal("content" in rejection, false);
+});
+
+test("apply wires durable backupRoot and audits edit/restore recovery versions", async () => {
+  const { tools } = mount(baseConfig());
+  const path = join(server.rootDir, "audit-restore.txt");
+  await writeFile(path, "original-private-payload\n");
+  const edited = await runTool(tools, "remote_edit", { host: "testbox", path, old_string: "original", new_string: "changed" });
+  const backup = JSON.parse(await readFile(join(testDshHome, "remote", "backups", `${edited.backupId}.json`), "utf8"));
+  assert.equal(backup.path, path);
+  assert.equal(Buffer.from(backup.content, "base64").toString(), "original-private-payload\n");
+  const editAudit = await latestAudit();
+  assert.equal(editAudit.backupId, edited.backupId);
+  assert.equal(editAudit.beforeVersion, edited.beforeVersion);
+  assert.equal(editAudit.afterVersion, edited.afterVersion);
+  assert.equal(editAudit.writeAttempted, true);
+  assert.ok(!JSON.stringify(editAudit).includes("private-payload"));
+  const restored = await runTool(tools, "remote_restore", { host: "testbox", backup_id: edited.backupId });
+  assert.equal(await readFile(path, "utf8"), "original-private-payload\n");
+  const restoreAudit = await latestAudit();
+  assert.equal(restoreAudit.action, "restore");
+  assert.equal(restoreAudit.risk, "write");
+  assert.equal(restoreAudit.backupId, restored.backupId);
+  assert.notEqual(restored.backupId, edited.backupId);
+  assert.equal(restored.afterVersion, edited.beforeVersion);
+});
+
+test("audit preserves recovery facts when independent verification fails", async () => {
+  const { tools } = mount(baseConfig());
+  const path = join(server.rootDir, "audit-verify.txt");
+  await writeFile(path, "old\n");
+  let failure;
+  await assert.rejects(runTool(tools, "remote_write", { host: "testbox", path, content: "new\n", verify_command: "sh -c 'exit 9'" }), error => {
+    failure = error;
+    return error.code === "VERIFICATION_FAILED";
+  });
+  const entry = await latestAudit();
+  assert.equal(entry.outcome, "verification_failed");
+  assert.equal(entry.backupId, failure.change.backupId);
+  assert.equal(entry.beforeVersion, failure.change.beforeVersion);
+  assert.equal(entry.afterVersion, failure.change.afterVersion);
+  assert.equal(entry.verification.status, "failed");
+  assert.equal(entry.verification.exitCode, 9);
+  assert.equal(await readFile(path, "utf8"), "new\n", "verification failure must not trigger an automatic restore");
+});
+
+test("apply forwards audit limits for runtime retention", async () => {
+  const { tools } = mount(baseConfig({ auditLimit: 2, auditMaxBytes: 2048, auditRetentionDays: 7 }));
+  for (let index = 0; index < 3; index++) {
+    await runTool(tools, "remote_exec", { description: "retained bounded inspection", host: "testbox", command: "hostname" });
+  }
+  const text = await readFile(join(testDshHome, "remote", "audit.jsonl"), "utf8");
+  assert.equal((await auditEntries()).length, 2);
+  assert.ok(Buffer.byteLength(text) <= 2048);
+});
+
+test("raw Agent input never enters command audit details", async () => {
+  const { tools } = mount(baseConfig());
+  const session = await runTool(tools, "remote_shell_open", { host: "testbox" });
+  await runTool(tools, "remote_shell_send", { sessionId: session.sessionId, text: "fixture-private-raw-input", submit: false });
+  const entry = await latestAudit();
+  assert.equal(entry.detail, "[raw input omitted]");
+  assert.ok(!JSON.stringify(entry).includes("fixture-private-raw-input"));
+  await runTool(tools, "remote_shell_close", { sessionId: session.sessionId });
 });

@@ -396,7 +396,7 @@ test("overview returns hosts, sessions, policy and the audit trail", async () =>
     // authHint follows the ambient environment (an agent socket may be set).
     assert.match(result.hosts[0].authHint, /ssh-agent|default keys|key file/);
     assert.deepEqual(result.sessions, [
-      { sessionId: "remote-shell-1", host: "testbox", name: null, status: { kind: "running" }, createdAt: 1_700_000_000_000 },
+      { sessionId: "remote-shell-1", host: "testbox", name: null, status: { kind: "running" }, createdAt: 1_700_000_000_000, ownerSessionId: null },
     ]);
     assert.equal(result.audit.length, 1);
     assert.equal(result.audit[0].tool, "remote_exec");
@@ -940,4 +940,26 @@ test("a missing connection fence fails closed", async () => {
   } finally {
     await api.close();
   }
+});
+
+test("audit persistence health is consistent in overview, list and fenced health endpoint", async (t) => {
+  const fakes = createFakes();
+  const api = await startApi(fakes);
+  t.after(() => api.close());
+  const health = (await call(api, "audit.health")).payload.result;
+  assert.equal(health.status, "memory-only");
+  assert.equal(health.persistent, false);
+  assert.deepEqual((await call(api, "overview")).payload.result.auditHealth, health);
+  assert.deepEqual((await call(api, "audit.list")).payload.result.health, health);
+  assert.equal((await call(api, "audit.health", {}, { headers: { "x-deny-test": "1" } })).status, 403);
+});
+
+test("failed audit clear is a visible API error, not a success response", async (t) => {
+  const fakes = createFakes();
+  fakes.audit.clear = () => ({ cleared: false });
+  const api = await startApi(fakes);
+  t.after(() => api.close());
+  const response = await call(api, "audit.clear");
+  assert.equal(response.payload.ok, false);
+  assert.equal(response.payload.error.code, "AUDIT_PERSISTENCE");
 });

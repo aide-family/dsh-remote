@@ -139,8 +139,10 @@ includes the SFTP code when present). Connection errors throw `SshError`
 
 Pool: one `ssh2.Client` per `host.id` + auth fingerprint, idle close after
 `idleMs` (default 60 000), channel-per-exec, SFTP channel per `withSftp` call,
-operations per host serialized. A dead pooled client is discarded and one
-retry is allowed for a fresh connection on channel-level failures.
+operations per host serialized. A dead pooled client is discarded. Read-only
+SFTP channel failures may retry once; exec and file writes never replay an
+uncertain request. SFTP tasks settle on AbortSignal and the configured exec
+operation timeout even if a server callback stalls.
 
 ## Policy contract — `lib/policy/index.js`
 
@@ -683,7 +685,7 @@ window.__ModuleLoader__.load({ id: "dsh-remote", factory(require) { … return {
   The API registers only when `config.managementApi !== false` and
   `ctx.get("webServer")` exists (conditional `ctx.inject(["webServer"], …)`).
 - **Audit wrapper.** `lib/index.js` wraps every registered ToolDefinition's
-  `execute` (both the eight remote tools and the six shell tools) and records
+  `execute` (the nine remote tools, including restore, and six shell tools) and records
   tool/host/action/risk/outcome/detail/duration, resolving the host from
   `args.host` or, for session-scoped tools, from `manager.describe`. Denials are
   detected from the tool error text and recorded as `denied` rather than
@@ -1489,3 +1491,75 @@ session: missing-session attach can connect and immediately close. This avoids a
 unbounded `1/120` retry loop without interpreting untrusted raw terminal output as
 an acknowledgement. Repeated legitimate transport reconnects consume the same budget;
 open a fresh native terminal after exhaustion. This does not change SSH PTY retries.
+
+## Production change safety initiative — implementation contracts
+
+Scope: safe file changes, per-host/tag safety profiles, truthful correlated audit.
+No real hosts are changed during development and no automatic profile installation.
+Saved trusted connection initialization (v0.6.3) remains unchanged; Agent commands
+continue to pass the approval gate. Direct human terminal input is operator-owned.
+
+Ownership for this initiative:
+- file-safety: `lib/tools.js`, new `lib/file-change*.js`, tool/file-safety tests.
+- production-policy: `lib/config.js`, `lib/approval.js`, new policy profile module,
+  policy/approval/config tests. Approval accepts optional `preview` (bounded text
+  Diff) and shows the full bounded subject without silently truncating the command.
+- truthful-audit: `lib/audit.js`, `lib/index.js`, `lib/api.js`, new audit helpers,
+  audit/plugin/management integration tests. Wire file-change persistence via
+  optional `createTools({ backupRoot })`, default `$DSH_HOME/remote/backups` in index.
+- lead: documentation, TODO, prompt/render/client integration as necessary and
+  final diff/test review. Coordinate shared files before any changes.
+
+File change results add `backupId`, `beforeVersion`, `afterVersion`, and optional
+`verification: { status, exitCode, timedOut }`; failures after a write carry
+`error.change` with the same recovery facts. Restore is an additional Agent tool
+`remote_restore(host, backup_id)` and always uses approval, exact target binding,
+Diff, and current-version revalidation. Backups are durable with restricted local
+permissions; inability to back up prevents overwriting. Created files have no
+original to restore; do not pretend a file deletion is an ordinary restore.
+Optional verification commands are independently risk-reviewed before mutation
+and executed only once after mutation; failed validation does not auto-reload or
+silently retry/restore. File-size/output caps and AbortSignal remain mandatory.
+
+Version revalidation detects changes during approval; SFTP cannot provide a
+cross-process atomic compare-and-swap. Serialize plugin writes per target and
+explicitly document the remaining external-writer race. Do not claim a filesystem
+transaction against external writers or an automatic rollback for arbitrary shell.
+
+Safety profiles select by host-name globs or tags, compose restrictively, and
+never loosen global readonly/deny/never policy. Production profiles require
+approval for unknown commands, expose target/environment/impact and full command.
+Target checks for terminal-only shortcuts must use trusted initialization metadata
+or explicit configured checks, never reinterpret arbitrary output as identity.
+
+Audit distinguishes tool transport completion from remote exit success, timeout,
+cancellation, denial, unknown outcome and validation failure. Entries correlate
+operation/call/session/agent identifiers and file backup/version facts, bounded
+redacted summaries (never raw credentials, file contents or complete Diff).
+Audit health is exposed through management API; retention/rotation must bound disk
+usage during operation, not only on restart. Existing history and export readers
+remain backward compatible.
+
+## Runtime target checks — standalone contracts
+
+Independent modules: target-checks.js (normalization/framing/context validation),
+target-binding.js (SSH coordinates plus exact shortcut route/action digest),
+target-controller.js (approval and fresh dispatch checks), target-registry.js with
+private-registry.js (operator configuration), target-api.js (get/save/delete),
+target-tools.js (remote_target_check), and client-target-ui.inc.js (host detail UI).
+
+Static and managed checks compose restrictively. Template/execution concepts are
+not needed to edit or evaluate logical-target identity. Probe/action approval
+waits revalidate expected check/connection digests; fallback exec/SFTP/PTY paths
+also revalidate fresh gates before dispatch, never upgrading an old approval when
+checks become enabled. Readonly/never and deny patterns remain hard restrictions.
+
+PTY ownership and current-channel/readiness leases remain mandatory with target
+checks. Human input/reconnect invalidates proof; reset is explicitly approved.
+Nonce frames prove completion, not prompts or silence. Unknown/partial outputs do
+not imply that an operation did not run. This is not a shell sandbox or attestation.
+
+SFTP mutations/transfers remain blocked for target-checked hosts because shell
+facts do not prove filesystem views. Other hosts preserve safe file backups,
+version revalidation and approved restore. Trust recorded backup facts, not an
+assumption that arbitrary shell mutations are transactional or automatically undone.

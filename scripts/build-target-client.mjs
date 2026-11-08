@@ -1,0 +1,12 @@
+import { readFile, writeFile } from 'node:fs/promises';
+const client = new URL('../lib/client.js', import.meta.url);
+const fragment = new URL('../lib/client-target-ui.inc.js', import.meta.url);
+const begin = '    // BEGIN GENERATED TARGET UI';
+const end = '    // END GENERATED TARGET UI';
+const original = await readFile(client, 'utf8');
+if (original.split(begin).length !== 2 || original.split(end).length !== 2) throw new Error('Missing/ambiguous target UI markers');
+const body = await readFile(fragment, 'utf8');
+const start = original.indexOf(begin), finish = original.indexOf(end, start) + end.length;
+const next = original.slice(0, start) + begin + '\n' + body.trimEnd() + '\n' + end + original.slice(finish);
+if (next !== original) await writeFile(client, next, 'utf8');
+console.log('Independent target configuration UI is integrated.');
