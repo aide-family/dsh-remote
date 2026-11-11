@@ -485,6 +485,20 @@ test('exec: pty option is accepted and runs the command', async (t) => {
   assert.match(result.stdout, /pty-ok/)
 })
 
+test('exec: targeted fixture failure survives an unrelated request and is consumed exactly once', async (t) => {
+  const { srv, transport, host, close } = await setup()
+  t.after(close)
+  const target = 'printf targeted-channel-loss'
+  srv.failNextExec(target)
+  const unrelated = await transport.exec(host, { command: 'printf late-unrelated-request' })
+  assert.equal(unrelated.stdout, 'late-unrelated-request')
+  await assert.rejects(transport.exec(host, { command: target }), isChannelFailure)
+  assert.equal(srv.execCommands.includes(target), false, 'rejected command must not execute or be replayed')
+  const explicit = await transport.exec(host, { command: target })
+  assert.equal(explicit.stdout, 'targeted-channel-loss')
+  assert.equal(srv.execCommands.filter(command => command === target).length, 1)
+})
+
 test('exec: uncertain channel failure is not automatically replayed', async (t) => {
   const { srv, transport, host, close } = await setup()
   t.after(close)

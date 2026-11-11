@@ -118,7 +118,7 @@ function generateUsableKeyPair(type, options = {}) {
  * @property {Array<any>} shellSessions
  * @property {number} shellTotal
  * @property {number} shellCount
- * @property {() => void} failNextExec
+ * @property {(command?: string) => void} failNextExec
  * @property {() => Promise<void>} close
  */
 
@@ -186,6 +186,7 @@ export async function startSshServer(options = {}) {
   /** @type {string[]} */
   const execCommands = []
   let failNextExecFlag = false
+  let failNextExecCommand
   /** @type {Array<any>} */
   const shellSessions = []
   let shellTotal = 0
@@ -711,8 +712,10 @@ export async function startSshServer(options = {}) {
           }
         })
         session.on('exec', (acceptExec, rejectExec, info) => {
-          if (failNextExecFlag) {
+          const command = typeof info?.command === 'string' ? info.command : ''
+          if (failNextExecFlag && (failNextExecCommand === undefined || failNextExecCommand === command)) {
             failNextExecFlag = false
+            failNextExecCommand = undefined
             try {
               rejectExec?.()
             } catch {
@@ -720,7 +723,6 @@ export async function startSshServer(options = {}) {
             }
             return
           }
-          const command = typeof info?.command === 'string' ? info.command : ''
           execCommands.push(command)
           if (execCommands.length > 100) execCommands.shift()
           const stream = acceptExec()
@@ -1000,7 +1002,9 @@ export async function startSshServer(options = {}) {
     get shellCount() {
       return shellSessions.filter((record) => record.closedAt === null).length
     },
-    failNextExec() {
+    failNextExec(command) {
+      if (command !== undefined && (typeof command !== 'string' || command.length === 0)) throw new TypeError('failure target must be a non-empty command')
+      failNextExecCommand = command
       failNextExecFlag = true
     },
     async close() {

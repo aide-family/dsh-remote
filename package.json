@@ -1,6 +1,6 @@
 {
   "name": "@aide-family/dsh-remote",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "DSH remote operations workbench with SSH host management, safe file changes, runtime target checks, approval-gated commands and truthful audit.",
   "type": "module",
   "main": "lib/index.js",

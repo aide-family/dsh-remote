@@ -502,8 +502,9 @@ test("audit records timeout, cancellation and lost-channel unknown instead of su
   assert.equal(timeout.timedOut, true);
   await assert.rejects(runTool(tools, "remote_exec", { description: "cancelled inspection", host: "testbox", command: "hostname" }, AbortSignal.abort()), { name: "AbortError" });
   assert.equal((await latestAudit()).outcome, "cancelled");
-  server.failNextExec();
-  await assert.rejects(runTool(tools, "remote_exec", { description: "inspect broken channel", host: "testbox", command: "hostname" }));
+  const lostCommand = "printf 'audit-channel-loss-probe'";
+  server.failNextExec(lostCommand);
+  await assert.rejects(runTool(tools, "remote_exec", { description: "inspect broken channel", host: "testbox", command: lostCommand }));
   assert.equal((await latestAudit()).outcome, "unknown");
 });
 

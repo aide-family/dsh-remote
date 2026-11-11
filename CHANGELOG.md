@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.10.0 — 2026-11-11
+## 0.10.1 — 2026-11-11
+
+- Releases the operations-workspace, connection-progress, SSH-tab naming and shared-PTY improvements listed below.
+- Fixes a CI fault-injection race: a late timed-out SSH request can no longer consume the rejection intended for a different command.
+- Adds deterministic targeted-rejection coverage while preserving cancellation, unknown-outcome and no-automatic-replay assertions.
+- The v0.10.0 publishing attempt was stopped by this CI failure before npm publication; its existing Git tag is unchanged.
+
+## 0.10.0 (release candidate; not published to npm) — 2026-11-11
 
 ### Added
 - Dedicated remote-operations workspace at `$DSH_HOME/workspaces/remote-ops`; each quick connection creates a fresh session in that fixed workspace.

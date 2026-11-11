@@ -781,7 +781,7 @@ npm test
 npm pack --dry-run
 ```
 
-Pushing a tag that exactly matches the manifest version (for example, `v0.10.0`)
+Pushing a tag that exactly matches the manifest version (for example, `v0.10.1`)
 starts the [publish workflow](https://github.com/aide-family/dsh-remote/blob/main/.github/workflows/publish-npm.yml).
 The workflow installs locked dependencies, builds the client and runs all unit
 and integration tests, checks the tag/package version match, previews the tarball,
@@ -789,8 +789,8 @@ then publishes publicly with provenance.
 The publisher must have rights to create packages in the `@aide-family` scope.
 
 ```sh
-git tag -a v0.10.0 -m "Release v0.10.0"
-git push origin v0.10.0
+git tag -a v0.10.1 -m "Release v0.10.1"
+git push origin v0.10.1
 ```
 
 Published versions cannot be reused. If a release has a mistake, fix it and
