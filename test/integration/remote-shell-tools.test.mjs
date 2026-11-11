@@ -84,7 +84,7 @@ function createFakeManager({ sessions = new Map(), behaviour = {} } = {}) {
     async close(request) {
       calls.push(["close", request]);
       sessionsById.delete(request.sessionId);
-      return true;
+      return behaviour.closeResult ?? true;
     },
     list(agent) {
       calls.push(["list", { agent }]);
@@ -290,6 +290,15 @@ test("remote_shell_close and remote_shell_list use the manager owner scope", asy
   assert.equal(closed.closed, true);
   assert.equal((await run("remote_shell_list", {})).sessions.length, 0);
   assert.equal(manager.calls.filter(([name]) => name === "close").length, 1);
+});
+
+test('shared shell close reports handle release instead of claiming native terminal exit', async () => {
+  const { run, byName } = mountTools({ managerOptions: { sessions: OPEN_SESSION(), behaviour: { closeResult: { closed: true, sharedTerminalPreserved: true } } } });
+  const result = await run('remote_shell_close', { sessionId: 'remote-shell-1' });
+  assert.equal(result.sharedTerminalPreserved, true);
+  assert.equal(result.terminalClosed, false);
+  const rendered = byName.get('remote_shell_close').output.render({}, result);
+  assert.match(rendered[0].text, /released Agent shell handle.*did not close/);
 });
 
 test("unknown and foreign sessions surface the manager error code", async () => {

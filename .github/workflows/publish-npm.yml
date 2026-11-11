@@ -38,16 +38,8 @@ jobs:
             exit 1
           fi
 
-      - name: Run unit tests
-        run: npm run test:unit
-
-      - name: Run DSH-independent integration tests
-        run: >-
-          node --test
-          test/integration/live-stream.test.mjs
-          test/integration/management-api.test.mjs
-          test/integration/relay.test.mjs
-          test/integration/terminal-manager.test.mjs
+      - name: Build and run all tests
+        run: npm test
 
       - name: Verify package contents
         run: npm pack --dry-run

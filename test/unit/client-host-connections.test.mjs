@@ -35,7 +35,10 @@ function setup(initialData, respond = async () => ({})) {
     useEffect() {}, // Seed overview directly; refresh requests still use the real callApi.
     useCallback(fn) { return fn },
   }
-  const instrumented = source.replace('    return plugin;', '    return { RemoteOpsPage };')
+  const instrumented = source.replace('    return plugin;', `    return {
+    RemoteOpsPage,
+    interceptConnect(fn) { connectHostTerminal = fn; }
+  };`)
   assert.notEqual(instrumented, source)
   vm.runInNewContext(instrumented, {
     window: { __ModuleLoader__: { load(value) { registration = value } } },
@@ -53,6 +56,7 @@ function setup(initialData, respond = async () => ({})) {
   const api = registration.factory((name) => { assert.equal(name, 'react'); return React })
   return {
     calls, focused,
+    interceptConnect: api.interceptConnect,
     setOverview(next) { data = next },
     render() {
       stateCursor = 0
@@ -108,6 +112,20 @@ function openClose(env) {
 }
 function failure(code, message = code) { return Object.assign(new Error(message), { code }) }
 function closeRequests(env) { return env.calls.filter((call) => call.method === 'session.close' || call.method === 'terminal.close') }
+
+test('management connect button prepares SSH operations but does not request automatic Agent handoff', async () => {
+  const env = setup(overview([host('Alpha')]))
+  const requests = []
+  env.interceptConnect(async (options) => {
+    requests.push(plain(options))
+    return { notice: null, injected: false }
+  })
+  const button = action(env.render(), 'connect')
+  assert.match(button.props.title, /等待你发送任务，不自动启动 Agent/)
+  button.props.onClick()
+  assert.deepEqual(requests, [{ name: 'Alpha', sessionId: null, talk: false, startNewSession: true }])
+  await Promise.resolve()
+})
 
 const searchable = host('Alpha-Prod', {
   target: 'Root@Target.Example:2200', host: 'Address.Example', username: 'DeployUser',

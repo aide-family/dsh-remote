@@ -566,7 +566,14 @@ standalone fallback but is not used by the plugin panel.
   Agent attachment preserves native-terminal dimensions. A relay entry marked
   `agentOwned` ignores idle TTL, and an unexpected PTY exit becomes `error`
   without auto-reconnecting into a fresh shell. `remote_shell_close` / Agent
-  disposal closes the exact relay entry.
+  disposal releases the borrowed Agent facade rather than closing the relay.
+  Release disables stale write/signal/resize first, invalidates only its owned
+  verification proof, and closes local subscriptions/timers. A pending send
+  fails as `SESSION_RELEASED`, not a fabricated remote `session_exit`. The tool
+  reports `sharedTerminalPreserved: true, terminalClosed: false` without claiming
+  the foreground command succeeded. Standalone Agent PTYs still close normally;
+  explicit management `adminClose` / relay close and relay shutdown terminate
+  the physical shared SSH channel.
 - **Human control is direct.** The xterm bridge forwards typed bytes (including
   Ctrl-C) directly to the same PTY. These keystrokes bypass Agent approval as
   operator actions and are not recorded in audit payloads; Agent-submitted lines
@@ -1336,7 +1343,106 @@ sidebar layout was an empty pane. The terminal tab is created through
 sidebar layout store is adopted — so the flow must run against a freshly
 navigated conversation, and every failure after navigation must stay visible.
 
-### Flow contract (`lib/client.js`)
+### Current quick-connect behavior (supersedes automatic handoff below)
+
+The management-page **连接并开始运维** button always uses the dedicated local
+`$DSH_HOME/workspaces/remote-ops` directory (default `~/.dsh/workspaces/remote-ops`).
+The fenced `workspace.prepare` API creates the directory idempotently and returns
+its canonical path; it never accepts a browser-supplied directory. The client
+registers/resolves that path with `workspaces.create({path})`, creates a **fresh**
+blank session with `sessions.create({workspaceId})`, navigates to the returned
+session ID, and verifies that exact ID in both the main column and right sidebar.
+Any preparation, registration, creation or navigation failure stops before SSH;
+there is no fallback to the current/recent project workspace. Existing files and
+sessions are kept, and historical conversations are not migrated automatically.
+
+The button then opens and verifies the native SSH terminal, and saves a user-pinned title
+`<SSH name> · 远程运维` through `sessions.using(..., ref =>
+ref.binding.session.rename(title))`. It does **not** send a conversation message
+or start Agent health checks. Opening a conversation and submitting a task are
+independent flags. Explicit Agent handoff remains available and names its new
+conversation `<SSH name> · 健康检查`; opening a terminal in an existing conversation
+does not rename it.
+
+Connection progress is a module-level attempt registered on the root
+`shell.overlay`, so it appears synchronously on connect and survives navigation
+to the fixed workspace session. Its ordered stages are workspace preparation,
+SSH authentication/initialization, native terminal mount, verified bridge attach,
+and finalization. Backend `terminal.list` polling observes only bounded safe
+`actionProgress` metadata while `terminal.open` is pending, and aborts/clears its
+timer when that request finishes. It never displays raw initialization commands
+or credentials, and does not simulate percentage completion. Success is shown
+only after bridge verification and applicable title persistence; incomplete and
+failed results are distinct and do not automatically retry.
+
+The dialog supports collapse/Escape and a root-level reopen button; collapsing
+only hides UI and is not cancellation. A synchronous global guard prevents
+parallel connects, including side-channel terminal.open calls. Reattach uses the
+same progress wrapper. Password dialogs stack above the still-visible progress
+window (z-index 100 vs 90). While covered, progress is inert/aria-hidden, has no
+Escape handler or focus trap, and does not restore outside focus on suspension;
+the password dialog exclusively owns input. The progress subscriber reconciles
+password state after subscribing, and resumes progress interaction after the
+password layer closes. Existing conversation flows mark workspace creation as
+not applicable rather than claiming a new workspace was created. Full connection
+success automatically closes the progress window and its collapsed launcher;
+failed/incomplete feedback remains available until dismissed. The original
+return-focus target survives password suspension. If workspace navigation removed
+that trigger, success may focus the exact native terminal created by the attempt,
+but only while its session and tab are still current; user navigation is respected.
+
+Steps have explicit semantic color classes and text: completed green, running
+blue, failed red, incomplete orange, pending/skipped gray. Status is never conveyed
+by color alone; completed steps retain a checkmark and every row has a text label.
+
+Native terminal tabs opened by the plugin are named with the logical SSH lookup
+name, not the entrance address or local shell executable. Once the exact native
+view is running and writable, the plugin awaits its public `view.rename(name)`
+method and verifies the updated title/state before writing the bridge command.
+This preserves the stock terminal title renderer, manual title editing, and
+native terminal ownership. Host metadata takes precedence, with the matching
+`sessionId::host` relay key as a fallback. A rename failure or conversation/input
+ownership change during rename stops before command injection. Conversation
+naming remains separate (`<SSH name> · <action>`). Existing previously opened tabs
+are not mutated by a global title override; new opens and reattaches use the SSH
+name automatically. Display names follow the Host terminal's 120-character limit;
+the underlying SSH lookup name and relay identity are never truncated.
+
+Native-terminal navigation uses a bounded paint hint: two animation frames,
+with a 250 ms timer fallback (30 ms when the animation API is absent). Hidden
+browser windows may suspend frame callbacks; these must never indefinitely delay
+bridge attachment after SSH initialization. Mounted-session and native writable
+checks still gate command input. This prevents an unbounded UI wait, but does not
+prove an already-attached SSH foreground is responsive. Bridge attachment and
+`connected` alone are not command completion or remote I/O liveness proof.
+New bridges negotiate an initial-only `dsh-remote-handshake-v1` response with a
+fresh 24-hex nonce. The relay prepends a bounded `RS + DSHREMOTE/1` JSON line only
+for opted-in clients; legacy raw clients keep their existing replay. Accepted
+responses are stripped before raw output, and later PTY bytes are never parsed as
+control. Successful lookup proving a missing/closed/error session returns
+`SESSION_GONE, retryable:false`; a lookup exception returns
+`LOOKUP_UNAVAILABLE, retryable:true`. A matching definitive rejection restores the
+bridge TTY and stops retries; temporary transport loss retains bounded recovery.
+No input is queued or replayed while acceptance is pending. Explicit relay close
+may cause one reconnect to discover definitive closure, not a 120-attempt storm.
+
+The bridge socket parser preserves all bytes following the handshake line,
+including complete and partial coalesced input/resize frames; handshake acceptance
+must not clear the already-sliced receive buffer. Agent tool writes bypass this
+socket parser, so this fix alone does not explain sustained Agent output silence.
+Live-command auto-open also treats an existing native `terminal` tab as already
+served: an Agent start event must not steal its selection to the read-only
+`dsh-remote-live` mirror. The mirror is not an interactive terminal. Native input
+can separately require explicit control reacquisition when another browser
+attachment holds its exclusive input lease.
+
+The title is durable metadata, not a prompt. In the shipped DSH 0.2.2-rc.1 stock
+workspace sidebar, blank conversations still render as “New Session” regardless
+of stored title until their first turn; the plugin must not send a dummy message
+to bypass that host UI limitation. Naming failures are surfaced without replaying
+the SSH connection or submitting an Agent message.
+
+### Historical v0.5.2 flow contract (`lib/client.js`)
 
 - **连接 / 连接并对话** (management page host row and the panel's talk button)
   now: (1) create/open a blank conversation with optional

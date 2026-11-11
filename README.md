@@ -27,7 +27,7 @@ dsh web
 `http://127.0.0.1:3080/`). Open it in a browser. Then check the version:
 
 ```sh
-dsh --version   # must be >= 0.2.1-rc.5
+dsh --version   # must be >= 0.2.2-rc.1
 ```
 
 > With the Desktop app, `dsh` may not be on your shell `PATH`; either use the
@@ -506,7 +506,7 @@ results or approval prompts.
 | `remote_shell_send` | per line | Write input (Enter submitted by default) and wait for output silence/timeout/exit. |
 | `remote_shell_read` | yes | Read a bounded scrollback page (newest-relative). |
 | `remote_shell_signal` | yes | Deliver SIGINT/SIGTERM/SIGKILL/SIGTSTP/SIGHUP to the foreground process group. |
-| `remote_shell_close` | no | Close a session and wait for its process tree to end. |
+| `remote_shell_close` | no | Release the Agent handle; preserve a shared user SSH terminal. Standalone Agent PTYs close normally. |
 | `remote_shell_list` | yes | List this agent's live shell sessions. |
 
 Typical agent loop:
@@ -572,11 +572,14 @@ DSH's native terminal (real xterm) connected by SSH, and **you** type in it.
 
 How it works:
 
-1. The **远程终端** panel (or a host row's **连接** on the Remote Ops page)
-   lists the discovered hosts. Pick one and click **打开终端**/**连接并对话**.
-   **连接** creates/reuses the SSH session and opens a **new conversation**,
-   then attaches the native terminal there; **打开终端** in the panel uses the
-   current conversation.
+1. On the Remote Ops page, select a host and click **连接并开始运维**.
+   It creates a fresh conversation in the fixed local operations workspace
+   `$DSH_HOME/workspaces/remote-ops` (default `~/.dsh/workspaces/remote-ops`),
+   shows real connection stages in a progress dialog, and does **not** send an
+   unsolicited Agent task. Password prompts appear above progress; successful
+   connection automatically closes progress. Native terminal tabs use the SSH
+   name. **打开终端** in the live panel keeps the current conversation; explicit
+   Agent handoff remains a separate action.
 2. The plugin opens a native terminal tab in the right sidebar of that
    conversation. A small local bridge (`bin/dsh-remote-terminal` →
    `lib/terminal/bridge.cjs`) connects to the Host's terminal relay over a
@@ -596,11 +599,16 @@ How it works:
    conversation, the Agent shell manager borrows that relay PTY rather than
    opening another SSH shell channel; opens are reused per Agent + host. Reopening
    the native terminal attaches to the same relay session. Closing its tab does
-   not idle-close an Agent-owned PTY; `remote_shell_close`, Agent disposal, or
-   plugin shutdown closes the shared session.
+   not idle-close an Agent-owned PTY. `remote_shell_close`, Agent disposal, and
+   shell-manager cleanup release only the Agent's borrowed handle; the shared
+   user SSH PTY remains available. Its idle TTL applies after the last Agent and
+   bridge detach. Explicit management-page SSH close or relay/plugin shutdown
+   terminates the actual shared connection.
 4. **Recovery is state-aware.** A terminal-only relay can reconnect with backoff
    (1s/2s/4s/8s/16s/30s, up to `userTerminalReconnectAttempts`) and the bridge
-   retries when the DSH Host restarts. If an Agent owns the PTY and its SSH
+   retries temporary socket outages. A negotiated `SESSION_GONE` rejection stops
+   bridge retries and asks for an explicit new connection; it never replays old
+   input or pretends a new shell preserves old state. If an Agent owns the PTY and its SSH
    channel exits, the relay marks that shared shell ended instead of reconnecting
    to a fresh shell that would falsely appear to preserve state; explicitly open
    a new session to continue.
@@ -765,16 +773,24 @@ The npm package name is `@aide-family/dsh-remote`; the DSH plugin row id remains
 `NPM_TOKEN` with publish permission for the `@aide-family` scope. Do not put the
 token in the repository or a checked-in `.npmrc`.
 
-Pushing a tag that exactly matches the manifest version (for example, `v0.6.2`)
+Before tagging a release, run the CI checks locally in a clean checkout:
+
+```sh
+npm ci --ignore-scripts
+npm test
+npm pack --dry-run
+```
+
+Pushing a tag that exactly matches the manifest version (for example, `v0.10.0`)
 starts the [publish workflow](https://github.com/aide-family/dsh-remote/blob/main/.github/workflows/publish-npm.yml).
-The workflow installs from the lockfile, runs unit tests plus the DSH-independent
-integration suites, checks the tag/package version match, previews the tarball,
+The workflow installs locked dependencies, builds the client and runs all unit
+and integration tests, checks the tag/package version match, previews the tarball,
 then publishes publicly with provenance.
 The publisher must have rights to create packages in the `@aide-family` scope.
 
 ```sh
-git tag v0.6.2
-git push origin v0.6.2
+git tag -a v0.10.0 -m "Release v0.10.0"
+git push origin v0.10.0
 ```
 
 Published versions cannot be reused. If a release has a mistake, fix it and

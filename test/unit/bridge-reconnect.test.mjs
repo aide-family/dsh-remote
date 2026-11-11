@@ -21,7 +21,7 @@ function bridgeHarness() {
     exit(code) { exitCode = code; },
   });
   const net = { connect() {
-    const socket = Object.assign(new EventEmitter(), { writable: true, write() {}, end() {}, destroy() {} });
+    const socket = Object.assign(new EventEmitter(), { writable: true, writes: [], write(text) { this.writes.push(String(text)); }, end() { this.emit('close'); }, destroy() { this.emit('close'); } });
     sockets.push(socket);
     return socket;
   } };
@@ -37,6 +37,59 @@ function bridgeHarness() {
     tick() { const [id, timer] = timers.entries().next().value; timers.delete(id); timer.fn(); return timer.delay; },
   };
 }
+
+function handshakeReply(socket, fields) {
+  const request = JSON.parse(socket.writes[0]);
+  return Buffer.from('\u001eDSHREMOTE/1 ' + JSON.stringify({ v: 1, nonce: request.nonce, ...fields }) + '\n');
+}
+
+test('confirmed missing session stops immediately without another reconnect', () => {
+  const h = bridgeHarness();
+  const socket = h.sockets[0];
+  socket.emit('connect');
+  socket.emit('data', handshakeReply(socket, { status: 'rejected', code: 'SESSION_GONE', retryable: false }));
+  assert.equal(h.tick(), 100);
+  assert.equal(h.exitCode, 1);
+  assert.equal(h.sockets.length, 1);
+  assert.deepEqual(h.modes, [true, false]);
+  assert.ok(h.output.join('').includes('已停止重连'));
+});
+
+test('fragmented acceptance strips only the prelude and forwards coalesced raw output', () => {
+  const h = bridgeHarness(), socket = h.sockets[0];
+  socket.emit('connect');
+  h.process.stdin.emit('data', 'unconfirmed-input');
+  const reply = handshakeReply(socket, { status: 'accepted' });
+  socket.emit('data', reply.subarray(0, 8));
+  socket.emit('data', Buffer.concat([reply.subarray(8), Buffer.from('hello-shell')]));
+  h.process.stdin.emit('data', 'hostname\r');
+  const inputs = socket.writes.map(text => JSON.parse(text)).filter(frame => frame.t === 'i');
+  assert.equal(inputs.length, 1);
+  assert.equal(Buffer.from(inputs[0].d, 'base64').toString(), 'hostname\r');
+  assert.ok(h.output.join('').includes('hello-shell'));
+  assert.equal(h.output.join('').includes('DSHREMOTE/1'), false);
+  const marker = '\u001eDSHREMOTE/1 this-is-ordinary-PTY-output';
+  socket.emit('data', Buffer.from(marker));
+  assert.ok(h.output.join('').includes(marker), 'post-accept output is never parsed as control');
+});
+
+test('retryable lookup failure retries rather than claiming the session is gone', () => {
+  const h = bridgeHarness(), socket = h.sockets[0];
+  socket.emit('connect');
+  socket.emit('data', handshakeReply(socket, { status: 'rejected', code: 'LOOKUP_UNAVAILABLE', retryable: true }));
+  assert.equal(h.tick(), 1000);
+  assert.equal(h.sockets.length, 2);
+  assert.equal(h.exitCode, undefined);
+});
+
+test('wrong nonce cannot trigger permanent session-closed handling', () => {
+  const h = bridgeHarness(), socket = h.sockets[0];
+  socket.emit('connect');
+  socket.emit('data', Buffer.from('\u001eDSHREMOTE/1 ' + JSON.stringify({ v: 1, nonce: 'wrong', status: 'rejected', code: 'SESSION_GONE', retryable: false }) + '\n'));
+  socket.emit('close');
+  assert.equal(h.tick(), 1000);
+  assert.equal(h.exitCode, undefined);
+});
 
 test("bridge bounds reconnects when TCP connects but the session repeatedly rejects attach", () => {
   const h = bridgeHarness();

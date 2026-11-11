@@ -1,12 +1,12 @@
 {
   "name": "@aide-family/dsh-remote",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "description": "DSH remote operations workbench with SSH host management, safe file changes, runtime target checks, approval-gated commands and truthful audit.",
   "type": "module",
   "main": "lib/index.js",
   "engines": {
     "node": "^22.19.0 || >=24.0.0",
-    "dsh": ">=0.2.1-rc.5"
+    "dsh": ">=0.2.2-rc.1"
   },
   "exports": {
     ".": "./lib/index.js",
@@ -18,6 +18,7 @@
     "bin/dsh-remote-terminal",
     "cordis.patch.yml",
     "README.md",
+    "CHANGELOG.md",
     "TODO.md",
     "LICENSE",
     "docs/icon.svg",
@@ -68,7 +69,7 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.5",
-    "@deepseek-ai/dsh": "^0.2.1-rc.5",
+    "@deepseek-ai/dsh": "^0.2.2-rc.1",
     "@deepseek-ai/dsh-tools": "^0.2.1-rc.5",
     "@deepseek-ai/schemastery": "^3.18.2"
   },
